@@ -1,7 +1,7 @@
 [project]
 name = "pancli"
-version = "2.0.0"
-description = "A modernized stateful REPL CLI for AnyShare (Beihang Netdisk)"
+version = "3.0.0"
+description = "AnyShare (Beihang Netdisk) 现代化 CLI 工具 — 异步并发 + Rich UI + Typer/Shell 混合架构"
 readme = "README.md"
 authors = [{ name = "LZR" }]
 dependencies = [
@@ -18,6 +18,13 @@ requires-python = ">=3.10"
 [project.scripts]
 bhpan = "pancli.main:cli"
 pancli = "pancli.main:cli"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
 
 [build-system]
 requires = ["hatchling"]

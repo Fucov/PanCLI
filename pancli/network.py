@@ -1,11 +1,12 @@
-"""HTTP transport layer built on httpx — replaces the old requests-based api.py."""
+"""HTTP transport layer built on httpx — sync + async with retry and resume support."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import ssl
 import time
-from typing import Any, Iterator
+from typing import Any, AsyncIterator
 
 import httpx
 
@@ -23,9 +24,6 @@ class ApiException(Exception):
 
 
 # ── SSL 证书补丁 ────────────────────────────────────────────────
-# 北航网盘使用 GlobalSign 证书链，部分系统缺失中间证书。
-# 将补丁证书写入用户数据目录，运行 httpx 时作为 verify 参数传入。
-
 _MISSING_CERT_PEM = """\
 -----BEGIN CERTIFICATE-----
 MIIDXzCCAkegAwIBAgILBAAAAAABIVhTCKIwDQYJKoZIhvcNAQELBQAwTDEgMB4G
@@ -49,7 +47,7 @@ Mx86OyXShkDOOyyGeMlhLxS67ttVb9+E7gUJTb0o2HLO02JQZR7rkpeDMdmztcpH
 WD9f
 -----END CERTIFICATE-----
 -----BEGIN CERTIFICATE-----
-MIIEsDCCA5igAwIBAgIQd70OB0LV2enQSdd00CpvmjANBgkqhkiG9w0BAQsFADBM
+MIIIEsDCCA5igAwIBAgIQd70OB0LV2enQSdd00CpvmjANBgkqhkiG9w0BAQsFADBM
 MSAwHgYDVQQLExdHbG9iYWxTaWduIFJvb3QgQ0EgLSBSMzETMBEGA1UEChMKR2xv
 YmFsU2lnbjETMBEGA1UEAxMKR2xvYmFsU2lnbjAeFw0yMDA3MjgwMDAwMDBaFw0y
 OTAzMTgwMDAwMDBaMFMxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9iYWxTaWdu
@@ -84,7 +82,7 @@ _RETRY_BACKOFF = 1  # seconds
 
 def _ensure_cert() -> str:
     """确保补丁证书文件存在，返回其路径。"""
-    get_data_dir()  # ensure dir
+    get_data_dir()
     if not CERT_FILE.exists():
         CERT_FILE.write_text(_MISSING_CERT_PEM)
     return str(CERT_FILE)
@@ -98,12 +96,29 @@ def _build_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 同步客户端工厂（保留，供 auth.py 使用）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
 def create_client(**kwargs: Any) -> httpx.Client:
-    """创建一个预配置好 SSL 的 httpx.Client。"""
+    """创建一个预配置好 SSL 的 httpx.Client（同步）。"""
     return httpx.Client(verify=_build_ssl_context(), timeout=60.0, **kwargs)
 
 
-# ── 通用 HTTP 方法（保留原有重试逻辑） ─────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 异步客户端工厂（新增）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def create_async_client(**kwargs: Any) -> httpx.AsyncClient:
+    """创建一个预配置好 SSL 的 httpx.AsyncClient（异步）。"""
+    return httpx.AsyncClient(verify=_build_ssl_context(), timeout=60.0, **kwargs)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 同步 HTTP 方法（保留原有逻辑，供 auth.py 鉴权层使用）
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def post_json(
@@ -119,7 +134,7 @@ def post_json(
         headers["Authorization"] = f"Bearer {tokenid}"
 
     _client = client or create_client()
-    own_client = client is None  # 需要自行关闭
+    own_client = client is None
 
     try:
         for retry in range(_MAX_RETRIES):
@@ -127,10 +142,8 @@ def post_json(
                 r = _client.post(url, headers=headers, json=json_obj)
                 if r.status_code != 503:
                     break
-                print(f"503 server busy, retry: {retry + 1}")
                 time.sleep(_RETRY_BACKOFF)
             except httpx.ConnectError:
-                print(f"ConnectError, retry: {retry + 1}")
                 time.sleep(_RETRY_BACKOFF)
 
         if r.status_code not in (200, 201):
@@ -168,7 +181,6 @@ def get_json(
             r = _client.get(url, headers=headers)
             if r.status_code != 503:
                 break
-            print(f"503 server busy, retry: {retry + 1}")
             time.sleep(_RETRY_BACKOFF)
 
         if r.status_code != 200:
@@ -204,7 +216,6 @@ def put_file(
                 _client.put(url, headers=headers, content=content)
                 return
             except httpx.ConnectError:
-                print(f"ConnectError, retry: {retry + 1}")
                 time.sleep(_RETRY_BACKOFF)
     finally:
         if own_client:
@@ -228,7 +239,7 @@ def stream_download(
     *,
     client: httpx.Client | None = None,
     chunk_size: int = 1024,
-) -> Iterator[bytes]:
+) -> Any:  # Iterator[bytes]
     """流式 GET 下载，yield 数据块。调用方负责关闭 client。"""
     _client = client or create_client()
     own_client = client is None
@@ -240,3 +251,156 @@ def stream_download(
     finally:
         if own_client:
             _client.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 异步 HTTP 方法（新增）
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def async_post_json(
+    url: str,
+    json_obj: Any,
+    *,
+    tokenid: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> dict | None:
+    """异步 POST JSON，自动重试 503 和连接错误。"""
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if tokenid is not None:
+        headers["Authorization"] = f"Bearer {tokenid}"
+
+    _client = client or create_async_client()
+    own_client = client is None
+
+    try:
+        for retry in range(_MAX_RETRIES):
+            try:
+                r = await _client.post(url, headers=headers, json=json_obj)
+                if r.status_code != 503:
+                    break
+                await asyncio.sleep(_RETRY_BACKOFF)
+            except httpx.ConnectError:
+                await asyncio.sleep(_RETRY_BACKOFF)
+
+        if r.status_code not in (200, 201):
+            err = None
+            try:
+                err = r.json()
+            except Exception:
+                pass
+            raise ApiException(err, f"api returned HTTP {r.status_code}\n{r.text}")
+
+        if r.text == "":
+            return None
+        return r.json()
+    finally:
+        if own_client:
+            await _client.aclose()
+
+
+async def async_get_json(
+    url: str,
+    *,
+    tokenid: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> dict | None:
+    """异步 GET + JSON 解析，自动重试。"""
+    headers: dict[str, str] = {}
+    if tokenid is not None:
+        headers["Authorization"] = f"Bearer {tokenid}"
+
+    _client = client or create_async_client()
+    own_client = client is None
+
+    try:
+        for retry in range(_MAX_RETRIES):
+            try:
+                r = await _client.get(url, headers=headers)
+                if r.status_code != 503:
+                    break
+                await asyncio.sleep(_RETRY_BACKOFF)
+            except httpx.ConnectError:
+                await asyncio.sleep(_RETRY_BACKOFF)
+
+        if r.status_code != 200:
+            err = None
+            try:
+                err = r.json()
+            except Exception:
+                pass
+            raise ApiException(err, f"api returned HTTP {r.status_code}\n{r.text}")
+
+        if r.text == "":
+            return None
+        return r.json()
+    finally:
+        if own_client:
+            await _client.aclose()
+
+
+async def async_put_file(
+    url: str,
+    headers: dict[str, str],
+    content: bytes | Any,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """异步 PUT 文件内容，自动重试连接错误。"""
+    _client = client or create_async_client()
+    own_client = client is None
+
+    try:
+        for retry in range(_MAX_RETRIES):
+            try:
+                await _client.put(url, headers=headers, content=content)
+                return
+            except httpx.ConnectError:
+                await asyncio.sleep(_RETRY_BACKOFF)
+    finally:
+        if own_client:
+            await _client.aclose()
+
+
+async def async_get_file(url: str, *, client: httpx.AsyncClient | None = None) -> bytes:
+    """异步 GET 文件并返回全部 bytes。"""
+    _client = client or create_async_client()
+    own_client = client is None
+    try:
+        r = await _client.get(url)
+        return r.content
+    finally:
+        if own_client:
+            await _client.aclose()
+
+
+async def async_stream_download(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    client: httpx.AsyncClient | None = None,
+    chunk_size: int = 65536,  # 64KB chunks for better performance
+) -> AsyncIterator[bytes]:
+    """异步流式下载，支持 Range header 实现断点续传。
+
+    Parameters
+    ----------
+    url : str
+        下载 URL
+    headers : dict | None
+        可选 Headers（如 Range: bytes=xxx-）
+    client : httpx.AsyncClient | None
+        外部传入的客户端
+    chunk_size : int
+        每次 yield 的块大小，默认 64KB
+    """
+    _client = client or create_async_client()
+    own_client = client is None
+    try:
+        async with _client.stream("GET", url, headers=headers or {}) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes(chunk_size):
+                yield chunk
+    finally:
+        if own_client:
+            await _client.aclose()

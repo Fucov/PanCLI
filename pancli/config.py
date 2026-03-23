@@ -1,4 +1,4 @@
-"""Configuration management using platformdirs."""
+"""Configuration management using platformdirs with theme support."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 
 from platformdirs import user_config_dir, user_data_dir
 
-from .models import AppConfig
+from .models import AppConfig, ThemeMode
 
 APP_NAME = "bhpan"
 
@@ -25,7 +25,7 @@ def get_data_dir() -> Path:
 
 
 # ── 配置读写 ────────────────────────────────────────────────────
-_CURRENT_REVISION = 2
+_CURRENT_REVISION = 4
 
 
 def load_config() -> AppConfig:
@@ -33,15 +33,21 @@ def load_config() -> AppConfig:
     _config_dir.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        # 版本迁移：旧版本中可能存在需要清除的字段
         old_rev = raw.get("revision", 0)
         if old_rev < _CURRENT_REVISION:
-            # revision 2 引入 encrypted 字段重置
-            if old_rev < 2:
-                raw.pop("encrypted", None)
-            raw["revision"] = _CURRENT_REVISION
+            raw = _migrate_config(raw, old_rev)
         return AppConfig.model_validate(raw)
     return AppConfig()
+
+
+def _migrate_config(raw: dict, old_rev: int) -> dict:
+    """配置版本迁移。"""
+    if old_rev < 2:
+        raw.pop("encrypted", None)
+    if old_rev < 4:
+        raw["theme"] = ThemeMode.AUTO.value
+    raw["revision"] = _CURRENT_REVISION
+    return raw
 
 
 def save_config(cfg: AppConfig) -> None:
