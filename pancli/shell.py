@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import glob
+import os
 import shlex
+import subprocess
 import sys
 
 from prompt_toolkit import PromptSession
@@ -45,7 +48,12 @@ from .models import AppConfig
 
 
 class AnyShareCompleter(Completer):
-    """远程路径智能补全。"""
+    """上下文感知的智能补全器。
+
+    - upload 第 1 个参数 → 本地文件补全
+    - download 第 2 个参数 → 本地文件补全
+    - cd/ls/cat/rm/stat/tree/head/tail/... → 远程路径补全
+    """
 
     CMDS = [
         "ls", "cd", "pwd", "tree", "cat", "head", "tail", "touch",
@@ -53,38 +61,29 @@ class AnyShareCompleter(Completer):
         "whoami", "logout", "su", "clear", "exit", "quit", "help",
     ]
 
+    # 第一个参数是本地路径的命令
+    _LOCAL_ARG1 = {"upload"}
+    # 第二个参数是本地路径的命令
+    _LOCAL_ARG2 = {"download"}
+    # 需要远程路径补全的命令
+    _REMOTE_CMDS = {"ls", "cd", "cat", "head", "tail", "stat", "tree", "touch",
+                    "mkdir", "rm", "mv", "cp", "upload", "download", "find"}
+
     def __init__(self, shell: PanShell) -> None:
         self.shell = shell
         self._cache: dict[str, list[str]] = {}
 
-    def get_completions(self, document: Document, complete_event):
-        text = document.text_before_cursor
-        try:
-            args = shlex.split(text)
-        except ValueError:
-            return
+    def _local_completions(self, word: str):
+        """本地文件系统补全。"""
+        for match in glob.glob(word + "*"):
+            display = os.path.basename(match)
+            if os.path.isdir(match):
+                match += "/"
+                display += "/"
+            yield Completion(match, start_position=-len(word), display=display)
 
-        # 补全命令名
-        if not text or (len(args) == 1 and not text.endswith(" ")):
-            word = args[0] if args else ""
-            for cmd in self.CMDS:
-                if cmd.startswith(word):
-                    yield Completion(cmd, start_position=-len(word))
-            return
-
-        # 补全远程路径（后台线程中运行同步代码以触发 API 调用）
-        word = "" if text.endswith(" ") else args[-1]
-        cmd = args[0]
-
-        # upload 的第一个参数补全本地文件
-        if cmd == "upload" and (len(args) == 2 if not text.endswith(" ") else len(args) == 1):
-            import glob
-            import os
-            for match in glob.glob(word + "*"):
-                yield Completion(match, start_position=-len(word), display=os.path.basename(match))
-            return
-
-        # 远程路径补全
+    def _remote_completions(self, word: str):
+        """远程 AnyShare 路径补全。"""
         if "/" in word:
             parent_str, prefix = word.rsplit("/", 1)
             parent_str = parent_str or "/"
@@ -102,12 +101,50 @@ class AnyShareCompleter(Completer):
                     dirs, files = asyncio.get_event_loop().run_until_complete(
                         self.shell.manager.list_dir(info.docid, by="name")
                     )
-                    self._cache[info.docid] = [d["name"] + "/" for d in dirs] + [f["name"] for f in files]
+                    self._cache[info.docid] = (
+                        [d["name"] + "/" for d in dirs] + [f["name"] for f in files]
+                    )
                 for name in self._cache[info.docid]:
                     if name.lower().startswith(prefix.lower()):
                         yield Completion(name, start_position=-len(prefix))
         except Exception:
             pass
+
+    def _arg_position(self, text: str, args: list[str]) -> int:
+        """计算当前正在编辑的参数位置（从 1 开始，0 = 命令名）。"""
+        if text.endswith(" "):
+            return len(args)  # 下一个参数
+        return len(args) - 1  # 当前正在输入的参数
+
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        try:
+            args = shlex.split(text)
+        except ValueError:
+            return
+
+        # 补全命令名
+        if not text or (len(args) == 1 and not text.endswith(" ")):
+            word = args[0] if args else ""
+            for cmd in self.CMDS:
+                if cmd.startswith(word):
+                    yield Completion(cmd, start_position=-len(word))
+            return
+
+        word = "" if text.endswith(" ") else args[-1]
+        cmd = args[0]
+        pos = self._arg_position(text, args)
+
+        # 判断是否需要本地补全
+        need_local = (
+            (cmd in self._LOCAL_ARG1 and pos == 1)
+            or (cmd in self._LOCAL_ARG2 and pos == 2)
+        )
+
+        if need_local:
+            yield from self._local_completions(word)
+        elif cmd in self._REMOTE_CMDS:
+            yield from self._remote_completions(word)
 
 
 # ── PanShell ────────────────────────────────────────────────────
@@ -142,9 +179,27 @@ class PanShell:
             while True:
                 try:
                     text = await session.prompt_async(f"PanCLI [{self.cwd}] $ ")
-                    if not text.strip():
+                    stripped = text.strip()
+                    if not stripped:
                         continue
-                    args = shlex.split(text)
+
+                    # ! 本地命令穿透
+                    if stripped.startswith("!"):
+                        local_cmd = stripped[1:].strip()
+                        if not local_cmd:
+                            continue
+                        if local_cmd.startswith("cd "):
+                            target_dir = local_cmd[3:].strip()
+                            try:
+                                os.chdir(os.path.expanduser(target_dir))
+                                console.print(f"[dim]本地路径已切换至: {os.getcwd()}[/dim]")
+                            except FileNotFoundError:
+                                console.print(f"[red]本地目录不存在: {target_dir}[/red]")
+                        else:
+                            subprocess.run(local_cmd, shell=True)
+                        continue
+
+                    args = shlex.split(stripped)
                     await self.dispatch(args[0], args[1:])
                 except KeyboardInterrupt:
                     continue
@@ -190,7 +245,11 @@ class PanShell:
                 ("download <远程> [本地] [-r] [-j N]", "并发下载（支持断点续传）"),
             ]),
             ("搜索", "blue", [
-                ("find <关键词> [-d 深度]", "递归全局搜索"),
+                ("find <关键词> [-d 深度]", "递归搜索 (支持 * ? 通配符)"),
+            ]),
+            ("本地穿透", "red", [
+                ("!<命令>", "执行本地系统命令 (如 !ls -al)"),
+                ("!cd <目录>", "切换本地工作目录"),
             ]),
         ]
         for title, color, cmds in sections:

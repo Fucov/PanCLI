@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import ssl
 import time
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator
+
+import asyncio as _asyncio
 
 import httpx
 
@@ -101,7 +102,7 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 def create_client(**kwargs: Any) -> httpx.Client:
     """创建同步 httpx.Client（用于 OAuth2 登录流程）。"""
-    return httpx.Client(verify=_build_ssl_context(), timeout=60.0, **kwargs)
+    return httpx.Client(verify=_build_ssl_context(), timeout=120.0, **kwargs)
 
 
 def post_json(
@@ -148,9 +149,13 @@ def post_json(
 # ── 异步 Client ─────────────────────────────────────────────────
 
 
+# 超时配置：AnyShare OSS 冷启动可能需要较长时间
+_ASYNC_TIMEOUT = httpx.Timeout(connect=30.0, read=120.0, write=120.0, pool=30.0)
+
+
 def create_async_client(**kwargs: Any) -> httpx.AsyncClient:
     """创建异步 httpx.AsyncClient。"""
-    return httpx.AsyncClient(verify=_build_ssl_context(), timeout=60.0, **kwargs)
+    return httpx.AsyncClient(verify=_build_ssl_context(), timeout=_ASYNC_TIMEOUT, **kwargs)
 
 
 async def async_post_json(
@@ -257,13 +262,27 @@ async def async_stream_download(
     client: httpx.AsyncClient,
     chunk_size: int = 8192,
     resume_from: int = 0,
+    max_retries: int = 3,
 ) -> AsyncIterator[bytes]:
-    """异步流式下载，支持断点续传（Range header）。"""
+    """异步流式下载，支持断点续传 + 500/502 重试。"""
     headers: dict[str, str] = {}
     if resume_from > 0:
         headers["Range"] = f"bytes={resume_from}-"
 
-    async with client.stream("GET", url, headers=headers) as response:
-        response.raise_for_status()
-        async for chunk in response.aiter_bytes(chunk_size):
-            yield chunk
+    for attempt in range(max_retries):
+        try:
+            async with client.stream("GET", url, headers=headers) as response:
+                if response.status_code in (500, 502, 503):
+                    if attempt < max_retries - 1:
+                        await _asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    response.raise_for_status()
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes(chunk_size):
+                    yield chunk
+                return  # 成功完成
+        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+            if attempt < max_retries - 1:
+                await _asyncio.sleep(2 * (attempt + 1))
+            else:
+                raise exc

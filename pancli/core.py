@@ -8,15 +8,16 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import fnmatch
 import getpass
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+
 
 from rich.console import Console
-from rich.panel import Panel
+
 from rich.progress import (
     BarColumn,
     DownloadColumn,
@@ -369,10 +370,8 @@ async def do_upload(
         return
 
     remote_info = await manager.get_resource_info_by_path(remote_target.strip("/"))
-    if not remote_info or remote_info.size != -1:
-        # 目标是目录
-        pass
-    else:
+    if remote_info and remote_info.size != -1:
+        # 远端目标是文件而不是目录
         console.print("[red]远程目标必须是目录[/red]")
         return
 
@@ -549,7 +548,12 @@ async def do_find(
     max_depth: int = 5,
     jobs: int = 8,
 ) -> None:
-    """递归搜索文件名包含 keyword 的文件。"""
+    """递归搜索文件名匹配 keyword 的文件（支持 * ? 通配符）。
+
+    如果 keyword 不含通配符，自动包裹为 *keyword*。
+    """
+    if "*" not in keyword and "?" not in keyword:
+        keyword = f"*{keyword}*"
     root_info = await manager.get_resource_info_by_path(root_path.strip("/"))
     if not root_info or root_info.size != -1:
         console.print("[red]搜索根目录无效[/red]")
@@ -564,11 +568,11 @@ async def do_find(
         async with sem:
             dirs, files = await manager.list_dir(docid, by="name")
         for f in files:
-            if keyword.lower() in f["name"].lower():
+            if fnmatch.fnmatch(f["name"].lower(), keyword.lower()):
                 results.append((f"{current_path}/{f['name']}", f["size"], f["modified"]))
         tasks = []
         for d in dirs:
-            if keyword.lower() in d["name"].lower():
+            if fnmatch.fnmatch(d["name"].lower(), keyword.lower()):
                 results.append((f"{current_path}/{d['name']}/", -1, d["modified"]))
             tasks.append(_search(d["docid"], f"{current_path}/{d['name']}", depth + 1))
         if tasks:
