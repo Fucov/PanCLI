@@ -55,7 +55,14 @@ def _sizeof_fmt(num: float, suffix: str = "") -> str:
 def _ts_fmt(ts: int) -> str:
     if ts <= 0:
         return "—"
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1000))
+    # AnyShare 返回的时间戳可能是微秒、毫秒或秒级
+    if ts > 1e15:       # 微秒
+        ts_sec = ts / 1_000_000
+    elif ts > 1e12:     # 毫秒
+        ts_sec = ts / 1_000
+    else:               # 秒
+        ts_sec = ts
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts_sec))
 
 
 # ── 路径解析 ────────────────────────────────────────────────────

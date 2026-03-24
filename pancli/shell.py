@@ -9,20 +9,23 @@ from __future__ import annotations
 import glob
 import os
 import shlex
+import stat as _stat
 import subprocess
 import sys
+import time
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
-from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from .api import AsyncApiManager
 from .config import load_config, save_config
 from .core import (
+    _sizeof_fmt,
+    _ts_fmt,
     abs_path,
     console,
     do_cat,
@@ -50,9 +53,10 @@ from .models import AppConfig
 class AnyShareCompleter(Completer):
     """上下文感知的智能补全器。
 
-    - upload 第 1 个参数 → 本地文件补全
-    - download 第 2 个参数 → 本地文件补全
-    - cd/ls/cat/rm/stat/tree/head/tail/... → 远程路径补全
+    - upload 第 1 个参数 → 本地文件补全；第 2 个参数 → 远程路径
+    - download 第 1 个参数 → 远程路径；第 2 个参数 → 本地文件补全
+    - ! 开头的命令 → 本地文件补全
+    - 其余网盘命令 → 远程路径补全（含 .. 上级目录）
     """
 
     CMDS = [
@@ -61,13 +65,19 @@ class AnyShareCompleter(Completer):
         "whoami", "logout", "su", "clear", "exit", "quit", "help",
     ]
 
-    # 第一个参数是本地路径的命令
-    _LOCAL_ARG1 = {"upload"}
-    # 第二个参数是本地路径的命令
-    _LOCAL_ARG2 = {"download"}
-    # 需要远程路径补全的命令
-    _REMOTE_CMDS = {"ls", "cd", "cat", "head", "tail", "stat", "tree", "touch",
-                    "mkdir", "rm", "mv", "cp", "upload", "download", "find"}
+    # 参数位置 → 补全类型
+    _LOCAL_POSITIONS: dict[str, set[int]] = {
+        "upload": {1},      # upload 第1参数=本地
+        "download": {2},    # download 第2参数=本地
+    }
+    _REMOTE_POSITIONS: dict[str, set[int]] = {
+        "upload": {2},      # upload 第2参数=远程
+        "download": {1},    # download 第1参数=远程
+    }
+    _REMOTE_CMDS = {
+        "ls", "cd", "cat", "head", "tail", "stat", "tree", "touch",
+        "mkdir", "rm", "mv", "cp", "find",
+    }
 
     def __init__(self, shell: PanShell) -> None:
         self.shell = shell
@@ -75,7 +85,8 @@ class AnyShareCompleter(Completer):
 
     def _local_completions(self, word: str):
         """本地文件系统补全。"""
-        for match in glob.glob(word + "*"):
+        pattern = word + "*" if word else "*"
+        for match in glob.glob(pattern):
             display = os.path.basename(match)
             if os.path.isdir(match):
                 match += "/"
@@ -83,12 +94,16 @@ class AnyShareCompleter(Completer):
             yield Completion(match, start_position=-len(word), display=display)
 
     def _remote_completions(self, word: str):
-        """远程 AnyShare 路径补全。"""
+        """远程 AnyShare 路径补全（含 .. 上级目录）。"""
         if "/" in word:
             parent_str, prefix = word.rsplit("/", 1)
             parent_str = parent_str or "/"
         else:
             parent_str, prefix = ".", word
+
+        # 始终提供 .. 作为候选项
+        if "..".startswith(prefix):
+            yield Completion("..", start_position=-len(prefix))
 
         try:
             import asyncio
@@ -111,16 +126,23 @@ class AnyShareCompleter(Completer):
             pass
 
     def _arg_position(self, text: str, args: list[str]) -> int:
-        """计算当前正在编辑的参数位置（从 1 开始，0 = 命令名）。"""
+        """当前正在编辑的参数位置（1 开始，0 = 命令名）。"""
         if text.endswith(" "):
-            return len(args)  # 下一个参数
-        return len(args) - 1  # 当前正在输入的参数
+            return len(args)
+        return len(args) - 1
 
     def get_completions(self, document: Document, complete_event):
         text = document.text_before_cursor
         try:
             args = shlex.split(text)
         except ValueError:
+            return
+
+        # ! 开头 → 本地文件补全
+        if text.lstrip().startswith("!"):
+            inner = text.lstrip()[1:]
+            word = "" if inner.endswith(" ") else (inner.split()[-1] if inner.split() else "")
+            yield from self._local_completions(word)
             return
 
         # 补全命令名
@@ -135,16 +157,53 @@ class AnyShareCompleter(Completer):
         cmd = args[0]
         pos = self._arg_position(text, args)
 
-        # 判断是否需要本地补全
-        need_local = (
-            (cmd in self._LOCAL_ARG1 and pos == 1)
-            or (cmd in self._LOCAL_ARG2 and pos == 2)
-        )
-
-        if need_local:
+        # 按命令+位置判断本地 or 远程
+        if cmd in self._LOCAL_POSITIONS and pos in self._LOCAL_POSITIONS[cmd]:
             yield from self._local_completions(word)
+        elif cmd in self._REMOTE_POSITIONS and pos in self._REMOTE_POSITIONS[cmd]:
+            yield from self._remote_completions(word)
         elif cmd in self._REMOTE_CMDS:
             yield from self._remote_completions(word)
+        elif cmd in ("upload", "download"):
+            # 超出已知位置 → 远程 fallback
+            yield from self._remote_completions(word)
+
+
+# ── 本地 !ls 美化渲染 ──────────────────────────────────────────
+
+
+def _rich_local_ls(target_dir: str = ".") -> None:
+    """使用 Rich Table 美化打印本地目录内容（复用网盘 ls 风格）。"""
+    try:
+        entries = sorted(os.listdir(target_dir))
+    except FileNotFoundError:
+        console.print(f"[red]本地目录不存在: {target_dir}[/red]")
+        return
+    except PermissionError:
+        console.print(f"[red]无权限: {target_dir}[/red]")
+        return
+
+    abs_dir = os.path.abspath(target_dir)
+    table = Table(title=f"📂 {abs_dir} (本地)", show_header=True, border_style="dim")
+    table.add_column("类型", width=4, justify="center")
+    table.add_column("大小", justify="right", style="green")
+    table.add_column("修改时间", style="yellow")
+    table.add_column("名称", style="white bold")
+
+    for name in entries:
+        full = os.path.join(abs_dir, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        is_dir = _stat.S_ISDIR(st.st_mode)
+        icon = "📁" if is_dir else "📄"
+        size_str = "" if is_dir else _sizeof_fmt(st.st_size)
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+        display_name = f"[blue]{name}/[/blue]" if is_dir else name
+        table.add_row(icon, size_str, mtime, display_name)
+
+    console.print(table)
 
 
 # ── PanShell ────────────────────────────────────────────────────
@@ -173,6 +232,7 @@ class PanShell:
         session: PromptSession = PromptSession(
             history=InMemoryHistory(),
             completer=ThreadedCompleter(AnyShareCompleter(self)),
+            complete_while_typing=False,  # Tab 触发补全，不干扰打字
         )
 
         try:
@@ -183,20 +243,36 @@ class PanShell:
                     if not stripped:
                         continue
 
-                    # ! 本地命令穿透
+                    # ── ! 本地命令穿透 ──
                     if stripped.startswith("!"):
                         local_cmd = stripped[1:].strip()
                         if not local_cmd:
                             continue
+
+                        # 防嵌套
+                        if local_cmd.startswith("pancli") or local_cmd.startswith("bhpan"):
+                            console.print("[red]禁止在 Shell 中嵌套启动 PanCLI！[/red]")
+                            continue
+
+                        # !cd → os.chdir
                         if local_cmd.startswith("cd "):
                             target_dir = local_cmd[3:].strip()
                             try:
                                 os.chdir(os.path.expanduser(target_dir))
-                                console.print(f"[dim]本地路径已切换至: {os.getcwd()}[/dim]")
+                                console.print(f"[cyan]本地路径已切换至: {os.getcwd()}[/cyan]")
                             except FileNotFoundError:
                                 console.print(f"[red]本地目录不存在: {target_dir}[/red]")
-                        else:
-                            subprocess.run(local_cmd, shell=True)
+                            continue
+
+                        # !ls / !ll → Rich 美化打印
+                        parts = shlex.split(local_cmd)
+                        if parts[0] in ("ls", "ll"):
+                            target = parts[1] if len(parts) > 1 else "."
+                            _rich_local_ls(target)
+                            continue
+
+                        # 其他本地命令
+                        subprocess.run(local_cmd, shell=True)
                         continue
 
                     args = shlex.split(stripped)
@@ -248,7 +324,8 @@ class PanShell:
                 ("find <关键词> [-d 深度]", "递归搜索 (支持 * ? 通配符)"),
             ]),
             ("本地穿透", "red", [
-                ("!<命令>", "执行本地系统命令 (如 !ls -al)"),
+                ("!<命令>", "执行本地系统命令"),
+                ("!ls [目录]", "Rich 美化的本地文件列表"),
                 ("!cd <目录>", "切换本地工作目录"),
             ]),
         ]
@@ -317,7 +394,6 @@ class PanShell:
     async def cmd_ls(self, args: list[str]) -> None:
         human = True
         path = "."
-        # 简单解析 -h 和 path
         for a in args:
             if a in ("-h", "--human"):
                 human = True
