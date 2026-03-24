@@ -1,4 +1,4 @@
-"""Pydantic data models for BHPAN CLI."""
+"""Pydantic data models for PanCLI."""
 
 from __future__ import annotations
 
@@ -49,6 +49,16 @@ class CachedToken(BaseModel):
     expires: float = 0.0
 
 
+class TransferTask(BaseModel):
+    """描述一个并发传输任务条目。"""
+
+    remote_path: str
+    local_path: str
+    size: int = 0
+    docid: str = ""
+    name: str = ""
+
+
 DEFAULT_PUBKEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4E+eiWRwffhRIPQYvlXU
 jf0b3HqCmosiCxbFCYI/gdfDBhrTUzbt3fL3o/gRQQBEPf69vhJMFH2ZMtaJM6oh
@@ -63,9 +73,10 @@ CwIDAQAB
 class AppConfig(BaseModel):
     """应用持久化配置。"""
 
-    revision: int = 3
+    revision: int = 4
     host: str = "bhpan.buaa.edu.cn"
     pubkey: str = DEFAULT_PUBKEY
+    theme: str = "auto"  # "dark" | "light" | "auto"
     username: str | None = None
     encrypted: str | None = None
     store_password: bool = True

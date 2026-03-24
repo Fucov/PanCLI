@@ -25,7 +25,7 @@ def get_data_dir() -> Path:
 
 
 # ── 配置读写 ────────────────────────────────────────────────────
-_CURRENT_REVISION = 2
+_CURRENT_REVISION = 4
 
 
 def load_config() -> AppConfig:
@@ -33,12 +33,12 @@ def load_config() -> AppConfig:
     _config_dir.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
         raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        # 版本迁移：旧版本中可能存在需要清除的字段
         old_rev = raw.get("revision", 0)
         if old_rev < _CURRENT_REVISION:
-            # revision 2 引入 encrypted 字段重置
             if old_rev < 2:
                 raw.pop("encrypted", None)
+            if old_rev < 4:
+                raw.setdefault("theme", "auto")
             raw["revision"] = _CURRENT_REVISION
         return AppConfig.model_validate(raw)
     return AppConfig()
