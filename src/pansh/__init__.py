@@ -1,4 +1,4 @@
-"""PanCLI package."""
+"""pansh package."""
 
 from .version import __version__
 

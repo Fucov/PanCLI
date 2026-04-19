@@ -12,7 +12,7 @@ from .models import MatchField, SelectedLocalItem, SelectedRemoteItem
 
 
 def _resolve_local_root(root_text: str) -> Path:
-    local_cwd = os.environ.get("PANCLI_LOCAL_CWD")
+    local_cwd = os.environ.get("pansh_LOCAL_CWD")
     path = Path(root_text).expanduser()
     if not path.is_absolute() and local_cwd:
         path = Path(local_cwd) / path

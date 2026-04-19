@@ -1,4 +1,4 @@
-"""YAML settings management for PanCLI."""
+"""YAML settings management for pansh."""
 
 from __future__ import annotations
 
@@ -12,12 +12,12 @@ import yaml
 
 from .config import get_config_dir
 
-ENV_SETTINGS_PATH = "PANCLI_CONFIG"
+ENV_SETTINGS_PATH = "pansh_CONFIG"
 
 
 def default_settings_text() -> str:
     return (
-        files("pancli")
+        files("pansh")
         .joinpath("defaults/settings.yaml")
         .read_text(encoding="utf-8")
     )
@@ -81,10 +81,10 @@ class Settings:
         cursor[parts[-1]] = value
 
     def _apply_env_overrides(self) -> None:
-        theme = os.environ.get("PANCLI_THEME")
+        theme = os.environ.get("pansh_THEME")
         if theme:
             self.set("theme.mode", theme)
-        jobs = os.environ.get("PANCLI_JOBS")
+        jobs = os.environ.get("pansh_JOBS")
         if jobs:
             self.set("transfer.default_jobs", int(jobs))
 

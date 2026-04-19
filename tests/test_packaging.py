@@ -4,25 +4,25 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pancli
+import pansh
 
 
 def test_version_export() -> None:
-    assert isinstance(pancli.__version__, str)
-    assert pancli.__version__
+    assert isinstance(pansh.__version__, str)
+    assert pansh.__version__
 
 
 def test_python_m_help() -> None:
     result = subprocess.run(
-        [sys.executable, "-m", "pancli", "--help"],
+        [sys.executable, "-m", "pansh", "--help"],
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode == 0
-    assert "pancli" in result.stdout.lower()
+    assert "pansh" in result.stdout.lower()
 
 
 def test_pyproject_has_console_script() -> None:
     text = Path("pyproject.toml").read_text(encoding="utf-8")
-    assert 'pancli = "pancli.main:main"' in text
+    assert 'pansh = "pansh.main:main"' in text

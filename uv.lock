@@ -673,7 +673,7 @@ wheels = [
 ]
 
 [[package]]
-name = "pancli"
+name = "pansh"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pancli"
+name = "pansh"
 dynamic = ["version"]
 description = "AnyShare / 北航网盘 CLI with Typer, Rich, and asyncio"
 readme = "README.md"
@@ -31,14 +31,14 @@ dev = [
 ]
 
 [project.scripts]
-pancli = "pancli.main:main"
-bhpan = "pancli.main:main"
+pansh = "pansh.main:main"
+bhpan = "pansh.main:main"
 
 [tool.hatch.version]
-path = "src/pancli/version.py"
+path = "src/pansh/version.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pancli"]
+packages = ["src/pansh"]
 
 [tool.hatch.build.targets.sdist]
 include = [

@@ -1,4 +1,4 @@
-"""Module entry point for ``python -m pancli``."""
+"""Module entry point for ``python -m pansh``."""
 
 from .main import main
 

@@ -1,4 +1,4 @@
-"""HTTP transport helpers for PanCLI."""
+"""HTTP transport helpers for pansh."""
 
 from __future__ import annotations
 

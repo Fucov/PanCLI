@@ -77,7 +77,7 @@ class PanShell:
         try:
             while True:
                 try:
-                    text = await session.prompt_async(f"PanCLI [{self.remote_cwd}] $ ")
+                    text = await session.prompt_async(f"pansh [{self.remote_cwd}] $ ")
                 except EOFError:
                     break
                 except KeyboardInterrupt:
@@ -91,15 +91,15 @@ class PanShell:
             await self.close()
 
     async def _show_command_help(self, command_name: str) -> None:
-        previous_remote = os.environ.get("PANCLI_REMOTE_CWD")
-        previous_local = os.environ.get("PANCLI_LOCAL_CWD")
-        os.environ["PANCLI_REMOTE_CWD"] = self.remote_cwd
-        os.environ["PANCLI_LOCAL_CWD"] = self.local_cwd
+        previous_remote = os.environ.get("pansh_REMOTE_CWD")
+        previous_local = os.environ.get("pansh_LOCAL_CWD")
+        os.environ["pansh_REMOTE_CWD"] = self.remote_cwd
+        os.environ["pansh_LOCAL_CWD"] = self.local_cwd
         try:
             await asyncio.to_thread(
                 get_command(app).main,
                 args=[command_name, "--help"],
-                prog_name="pancli",
+                prog_name="pansh",
                 standalone_mode=False,
             )
         except click.ClickException as exc:
@@ -110,13 +110,13 @@ class PanShell:
             pass
         finally:
             if previous_remote is None:
-                os.environ.pop("PANCLI_REMOTE_CWD", None)
+                os.environ.pop("pansh_REMOTE_CWD", None)
             else:
-                os.environ["PANCLI_REMOTE_CWD"] = previous_remote
+                os.environ["pansh_REMOTE_CWD"] = previous_remote
             if previous_local is None:
-                os.environ.pop("PANCLI_LOCAL_CWD", None)
+                os.environ.pop("pansh_LOCAL_CWD", None)
             else:
-                os.environ["PANCLI_LOCAL_CWD"] = previous_local
+                os.environ["pansh_LOCAL_CWD"] = previous_local
 
     def _render_help_section(self, title: str, rows: list[tuple[str, str]]) -> Group:
         table = Table.grid(padding=(0, 2), expand=False)
@@ -141,28 +141,28 @@ class PanShell:
         self.console.print(
             Panel.fit(
                 body,
-                title="PanCLI Shell",
+                title="pansh Shell",
                 border_style="text",
                 padding=(0, 1),
             )
         )
 
     def _resolve_remote_path(self, target: str) -> str:
-        previous_remote = os.environ.get("PANCLI_REMOTE_CWD")
-        previous_local = os.environ.get("PANCLI_LOCAL_CWD")
-        os.environ["PANCLI_REMOTE_CWD"] = self.remote_cwd
-        os.environ["PANCLI_LOCAL_CWD"] = self.local_cwd
+        previous_remote = os.environ.get("pansh_REMOTE_CWD")
+        previous_local = os.environ.get("pansh_LOCAL_CWD")
+        os.environ["pansh_REMOTE_CWD"] = self.remote_cwd
+        os.environ["pansh_LOCAL_CWD"] = self.local_cwd
         try:
             candidate = _normalize_remote_path(target, self.home_root)
         finally:
             if previous_remote is None:
-                os.environ.pop("PANCLI_REMOTE_CWD", None)
+                os.environ.pop("pansh_REMOTE_CWD", None)
             else:
-                os.environ["PANCLI_REMOTE_CWD"] = previous_remote
+                os.environ["pansh_REMOTE_CWD"] = previous_remote
             if previous_local is None:
-                os.environ.pop("PANCLI_LOCAL_CWD", None)
+                os.environ.pop("pansh_LOCAL_CWD", None)
             else:
-                os.environ["PANCLI_LOCAL_CWD"] = previous_local
+                os.environ["pansh_LOCAL_CWD"] = previous_local
         if candidate == "/":
             return self.home_root
         return candidate
@@ -227,17 +227,17 @@ class PanShell:
                 self.console.print(item.name + suffix)
             return False
 
-        previous_remote = os.environ.get("PANCLI_REMOTE_CWD")
-        previous_local = os.environ.get("PANCLI_LOCAL_CWD")
-        os.environ["PANCLI_REMOTE_CWD"] = self.remote_cwd
-        os.environ["PANCLI_LOCAL_CWD"] = self.local_cwd
+        previous_remote = os.environ.get("pansh_REMOTE_CWD")
+        previous_local = os.environ.get("pansh_LOCAL_CWD")
+        os.environ["pansh_REMOTE_CWD"] = self.remote_cwd
+        os.environ["pansh_LOCAL_CWD"] = self.local_cwd
         try:
             if len(argv) == 2 and argv[1] == "-h":
                 argv = [argv[0], "--help"]
             await asyncio.to_thread(
                 get_command(app).main,
                 args=argv,
-                prog_name="pancli",
+                prog_name="pansh",
                 standalone_mode=False,
             )
         except click.ClickException as exc:
@@ -254,13 +254,13 @@ class PanShell:
             self.console.print(f"发生未预期错误：{exc}", style="error")
         finally:
             if previous_remote is None:
-                os.environ.pop("PANCLI_REMOTE_CWD", None)
+                os.environ.pop("pansh_REMOTE_CWD", None)
             else:
-                os.environ["PANCLI_REMOTE_CWD"] = previous_remote
+                os.environ["pansh_REMOTE_CWD"] = previous_remote
             if previous_local is None:
-                os.environ.pop("PANCLI_LOCAL_CWD", None)
+                os.environ.pop("pansh_LOCAL_CWD", None)
             else:
-                os.environ["PANCLI_LOCAL_CWD"] = previous_local
+                os.environ["pansh_LOCAL_CWD"] = previous_local
         return False
 
 

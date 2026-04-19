@@ -1,4 +1,4 @@
-"""Typer application entry point for PanCLI."""
+"""Typer application entry point for pansh."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from .transfer import batch_download, batch_upload
 from .version import __version__
 
 logger = logging.getLogger(__name__)
-app = typer.Typer(name="pancli", no_args_is_help=False, invoke_without_command=True)
+app = typer.Typer(name="pansh", no_args_is_help=False, invoke_without_command=True)
 trash_app = typer.Typer(help="回收站管理")
 app.add_typer(trash_app, name="trash", hidden=True)
 
@@ -47,7 +47,7 @@ def _run(coro):
 
 
 def _resolve_local_path(path: str) -> Path:
-    local_cwd = os.environ.get("PANCLI_LOCAL_CWD")
+    local_cwd = os.environ.get("pansh_LOCAL_CWD")
     resolved = Path(path).expanduser()
     if not resolved.is_absolute() and local_cwd:
         resolved = Path(local_cwd) / resolved
@@ -98,7 +98,7 @@ def _fmt_ts(value: int) -> str:
 
 
 def _normalize_remote_path(path: str, home_root: str) -> str:
-    cwd = os.environ.get("PANCLI_REMOTE_CWD", home_root)
+    cwd = os.environ.get("pansh_REMOTE_CWD", home_root)
     if path in ("", "."):
         raw = cwd
     elif path.startswith("/"):

@@ -1,4 +1,4 @@
-"""Pydantic data models used by PanCLI."""
+"""Pydantic data models used by pansh."""
 
 from __future__ import annotations
 

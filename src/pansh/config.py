@@ -10,12 +10,12 @@ from platformdirs import user_config_dir, user_data_dir
 
 from .models import AppConfig
 
-APP_NAME = "pancli"
+APP_NAME = "pansh"
 LEGACY_APP_NAME = "bhpan"
 
 
 def get_config_dir() -> Path:
-    override = os.environ.get("PANCLI_CONFIG")
+    override = os.environ.get("pansh_CONFIG")
     if override:
         path = Path(override).expanduser().resolve()
         if path.suffix:

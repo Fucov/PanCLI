@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pancli.models import MatchField
-from pancli.selectors import select_local_files
+from pansh.models import MatchField
+from pansh.selectors import select_local_files
 
 
 def test_select_local_files_with_glob(tmp_path: Path) -> None:

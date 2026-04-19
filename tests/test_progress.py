@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pancli.progress import Speedometer, format_eta, format_rate
+from pansh.progress import Speedometer, format_eta, format_rate
 
 
 def test_speedometer_smooths_speed() -> None:
