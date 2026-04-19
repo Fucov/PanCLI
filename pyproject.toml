@@ -1,32 +1,61 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
 [project]
 name = "pancli"
-version = "3.0.0"
-description = "AnyShare (Beihang Netdisk) 现代化 CLI 工具 — 异步并发 + Rich UI + Typer/Shell 混合架构"
+dynamic = ["version"]
+description = "AnyShare / 北航网盘 CLI with Typer, Rich and asyncio"
 readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
 authors = [{ name = "LZR" }]
 dependencies = [
-    "httpx>=0.27.0",
-    "platformdirs>=4.2.0",
-    "prompt-toolkit>=3.0.43",
-    "pydantic>=2.7.0",
-    "rich>=13.7.1",
-    "rsa>=4.9",
-    "typer>=0.12.0",
-    "pyyaml>=6.0",
+  "httpx>=0.27.0",
+  "platformdirs>=4.2.0",
+  "prompt-toolkit>=3.0.43",
+  "pydantic>=2.7.0",
+  "pyyaml>=6.0",
+  "rich>=13.7.1",
+  "rsa>=4.9",
+  "typer>=0.12.0",
 ]
-requires-python = ">=3.10"
-
-[project.scripts]
-bhpan = "pancli.main:cli"
-pancli = "pancli.main:cli"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0",
-    "ruff>=0.4.0",
-    "mypy>=1.10.0",
+  "build>=1.2.2",
+  "mypy>=1.10.0",
+  "pytest>=8.0.0",
+  "ruff>=0.4.0",
 ]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+[project.scripts]
+pancli = "pancli.main:main"
+bhpan = "pancli.main:main"
+
+[tool.hatch.version]
+path = "pancli/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pancli"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/pancli",
+  "/tests",
+  "/README.md",
+  "/pyproject.toml",
+  "/LICENSE",
+]
+
+[tool.pytest.ini_options]
+norecursedirs = [
+  ".venv",
+  ".pytest_cache",
+  ".pytest-tmp",
+  ".tmp",
+  ".tmp-settings",
+  "dist",
+  "build",
+  "pytest-cache-files-*",
+]

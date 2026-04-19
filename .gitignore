@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 Doc/
+.tmp*
+.pytest_cache/
+.pytest-tmp/
+pytest-cache-files-*/
+dist/
+build/

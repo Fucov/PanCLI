@@ -1,1087 +1,956 @@
-"""BHPAN CLI v3 Entry Point — Typer hybrid router with Rich UI."""
+"""Typer application entry point for PanCLI."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import getpass
+import json
+import logging
 import os
-import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import typer
-from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
 from rich.tree import Tree
 
-from . import __version__
-from .api import (
-    AsyncApiManager,
-    InvalidRootException,
-    MoveToChildDirectoryException,
-    NeedReviewException,
-    WrongPasswordException,
-)
+from .api import AsyncApiManager, InvalidRootException, WrongPasswordException
 from .auth import rsa_encrypt
-from .config import load_config, save_config
-from .models import AppConfig, SearchResult, TransferTask
-from .transfer import batch_download, batch_upload, build_download_tasks, build_upload_tasks
+from .config import AUTH_FILE, load_config, save_config
+from .models import MatchField, SelectedRemoteItem, TransferStatus, TransferTask
+from .progress import format_bytes
+from .selectors import filter_remote_items, select_local_files
+from .settings import get_settings_path, load_settings, reload_settings
+from .theme import UIOptions, create_console
+from .transfer import batch_download, batch_upload
+from .version import __version__
 
-__version__ = "3.0.0"
-
-app = typer.Typer(
-    name="pancli",
-    help="AnyShare (BHPAN) 现代化命令行工具",
-    invoke_without_command=True,
-    add_completion=False,
-)
-
-console = Console()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Rich Theme 主题系统
-# ═══════════════════════════════════════════════════════════════════════════════
+logger = logging.getLogger(__name__)
+app = typer.Typer(name="pancli", no_args_is_help=False, invoke_without_command=True)
+trash_app = typer.Typer(help="Trash management")
+app.add_typer(trash_app, name="trash")
 
 
-DARK_THEME = {
-    "repr.number": "cyan",
-    "status.spinning": "cyan",
-    "success": "green",
-    "warning": "yellow",
-    "error": "red bold",
-    "info": "blue",
-}
-
-LIGHT_THEME = {
-    "repr.number": "blue",
-    "status.spinning": "blue",
-    "success": "green bold",
-    "warning": "yellow bold",
-    "error": "red bold",
-    "info": "blue bold",
-}
+@dataclass
+class AppState:
+    ui: UIOptions
+    console: Any
+    stderr_console: Any
+    settings: Any
+    debug: bool = False
 
 
-def _detect_dark_mode() -> bool:
-    """简单检测终端是否深色模式（检查环境变量）。"""
-    if os.name == "nt":
-        try:
-            import ctypes
-            import struct
-
-            try:
-                ctypes.windll.shcore.GetSystemThemeBrush.restype = ctypes.c_void_p
-                ref = ctypes.c_int()
-                ctypes.windll.shcore.GetSystemThemeBrush(ctypes.byref(ref), 0, 0)
-                if ref.value:
-                    return False
-            except Exception:
-                pass
-        except Exception:
-            pass
-    return True
+def _run(coro):
+    return asyncio.run(coro)
 
 
-def get_theme(is_dark: bool | None = None) -> dict:
-    """获取 Rich 主题配置。"""
-    if is_dark is None:
-        is_dark = _detect_dark_mode()
-    return DARK_THEME if is_dark else LIGHT_THEME
+def _configure_logging(debug: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if debug else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 辅助函数
-# ═══════════════════════════════════════════════════════════════════════════════
+def _state(ctx: typer.Context) -> AppState:
+    return ctx.obj  # type: ignore[return-value]
 
 
-def _sizeof_fmt(num: float, suffix: str = "") -> str:
-    for unit in ("", "K", "M", "G", "T", "P", "E", "Z"):
-        if abs(num) < 1024.0:
-            return f"{num:3.1f}{unit}{suffix}"
-        num /= 1024.0
-    return f"{num:.1f}Yi{suffix}"
+def _json_print(data: Any) -> None:
+    typer.echo(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def _ts_fmt(us: int) -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(us / 1_000_000))
+def _error(message: str, *, code: int = 1) -> None:
+    typer.echo(message, err=True)
+    raise typer.Exit(code=code)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 登录逻辑
-# ═══════════════════════════════════════════════════════════════════════════════
+def _fmt_ts(value: int) -> str:
+    if value <= 0:
+        return "-"
+    if value > 10**15:
+        value = value // 1_000_000
+    elif value > 10**12:
+        value = value // 1_000
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
 
 
-async def _login(cfg: AppConfig) -> AsyncApiManager:
-    """异步登录，返回 AsyncApiManager 实例。"""
-    username = cfg.username or console.input("[bold cyan]Username:[/bold cyan] ")
-    store_password = cfg.store_password
-    password: str | None = None
-    encrypted: str | None = None
-
-    if store_password:
-        encrypted = cfg.encrypted
-        if encrypted is None:
-            password = getpass.getpass()
-            encrypted = rsa_encrypt(password, cfg.pubkey)
-            cfg.encrypted = encrypted
+def _normalize_remote_path(path: str, home_root: str) -> str:
+    cwd = os.environ.get("PANCLI_REMOTE_CWD", home_root)
+    if path in ("", "."):
+        raw = cwd
+    elif path.startswith("/"):
+        raw = path
     else:
-        password = getpass.getpass()
-        encrypted = rsa_encrypt(password, cfg.pubkey)
-
-    for retry in range(3):
-        try:
-            manager = AsyncApiManager(
-                cfg.host,
-                username,
-                password,
-                cfg.pubkey,
-                encrypted=encrypted,
-                cached_token=cfg.cached_token.token or None,
-                cached_expire=cfg.cached_token.expires or None,
-            )
-            await manager.initialize()
-            cfg.username = username
-            if manager._expires > 0:
-                cfg.cached_token.token = manager._tokenid
-                cfg.cached_token.expires = manager._expires
-            save_config(cfg)
-            console.print(f"[green]✓[/green] 已连接: {cfg.host}")
-            return manager
-        except WrongPasswordException:
-            console.print(f"[yellow]密码错误重试 ({retry + 1}/3)[/yellow]")
-            time.sleep(1)
-            password = getpass.getpass()
-            encrypted = rsa_encrypt(password, cfg.pubkey)
-            cfg.encrypted = encrypted
-
-    console.print("[bold red]登录失败[/bold red]")
-    sys.exit(1)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 路径解析
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-async def resolve_path(
-    manager: AsyncApiManager, path: str, home_name: str
-) -> tuple[str, str]:
-    """解析路径，返回 (绝对路径, docid)。"""
-    if path.startswith("/"):
-        p = path
-    elif path == ".":
-        p = f"/{home_name}"
-    else:
-        p = path
-
-    parts = []
-    for part in p.split("/"):
-        if not part or part == ".":
+        raw = f"{cwd.rstrip('/')}/{path}" if cwd != "/" else f"/{path}"
+    parts: list[str] = []
+    for chunk in raw.split("/"):
+        if not chunk or chunk == ".":
             continue
-        if part == "..":
+        if chunk == "..":
             if parts:
                 parts.pop()
-        else:
-            parts.append(part)
-
-    abs_path = "/" + "/".join(parts) if parts else "/"
-    abs_path_stripped = abs_path.strip("/")
-
-    if abs_path_stripped:
-        docid = await manager.get_resource_id(abs_path_stripped)
-    else:
-        docid = None
-
-    return abs_path, docid
+            continue
+        parts.append(chunk)
+    return "/" + "/".join(parts)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Typer 命令路由
-# ═══════════════════════════════════════════════════════════════════════════════
+async def _login(console: Any) -> tuple[AsyncApiManager, str]:
+    cfg = load_config()
+    username = cfg.username or console.input("Username: ")
+    encrypted = cfg.encrypted
+    password: str | None = None
+    if not encrypted or not cfg.store_password:
+        password = getpass.getpass("Password: ")
+        encrypted = rsa_encrypt(password, cfg.pubkey)
+        if cfg.store_password:
+            cfg.encrypted = encrypted
+    for attempt in range(3):
+        manager = AsyncApiManager(
+            cfg.host,
+            username,
+            password,
+            cfg.pubkey,
+            encrypted=encrypted,
+            cached_token=cfg.cached_token.token or None,
+            cached_expire=cfg.cached_token.expires or None,
+        )
+        try:
+            with console.status("Connecting..."):
+                started = time.perf_counter()
+                await manager.initialize()
+                logger.debug("login took %.3fs", time.perf_counter() - started)
+            cfg.username = username
+            cfg.cached_token.token = manager._tokenid
+            cfg.cached_token.expires = manager._expires
+            save_config(cfg)
+            entrydoc = await manager.get_entrydoc()
+            if not entrydoc:
+                await manager.close()
+                _error("Unable to read entry document library.")
+            return manager, "/" + entrydoc[0]["name"]
+        except WrongPasswordException:
+            await manager.close()
+            if attempt == 2:
+                break
+            console.print("Wrong password, try again.", style="warning")
+            password = getpass.getpass("Password: ")
+            encrypted = rsa_encrypt(password, cfg.pubkey)
+            cfg.encrypted = encrypted
+    _error("Authentication failed.")
+    raise RuntimeError("unreachable")
+
+
+async def _with_manager(ctx: typer.Context) -> tuple[AsyncApiManager, str]:
+    return await _login(_state(ctx).console)
+
+
+async def _collect_remote_items(
+    manager: AsyncApiManager,
+    root_path: str,
+    *,
+    recursive: bool,
+) -> list[SelectedRemoteItem]:
+    info = await manager.get_resource_info_by_path(root_path.strip("/"))
+    if info is None:
+        return []
+    if not info.is_dir:
+        return [
+            SelectedRemoteItem(
+                remote_path=root_path,
+                relative_path=info.name,
+                basename=info.name,
+                size=info.size,
+                docid=info.docid,
+            )
+        ]
+    items: list[SelectedRemoteItem] = []
+    root_name = Path(root_path.rstrip("/")).name
+
+    async def walk(docid: str, current_path: str, relative_prefix: str) -> None:
+        dirs, files = await manager.list_dir(docid, by="name")
+        for file in files:
+            relative = f"{relative_prefix}/{file.name}".strip("/")
+            items.append(
+                SelectedRemoteItem(
+                    remote_path=f"{current_path}/{file.name}".replace("//", "/"),
+                    relative_path=relative,
+                    basename=file.name,
+                    size=file.size,
+                    docid=file.docid,
+                )
+            )
+        if not recursive:
+            return
+        for directory in dirs:
+            await walk(
+                directory.docid,
+                f"{current_path}/{directory.name}".replace("//", "/"),
+                f"{relative_prefix}/{directory.name}".strip("/"),
+            )
+
+    await walk(info.docid, root_path, root_name)
+    return items
+
+
+def _preview_local(console: Any, items: list[Any], *, title: str) -> None:
+    table = Table(title=title)
+    table.add_column("Name")
+    table.add_column("Relative Path")
+    table.add_column("Size", justify="right")
+    for item in items[:100]:
+        table.add_row(item.basename, item.relative_path, format_bytes(item.size))
+    if len(items) > 100:
+        table.add_row("...", "...", "...")
+    console.print(table)
+    console.print(f"{len(items)} item(s), {format_bytes(sum(item.size for item in items))}")
+
+
+def _preview_remote(console: Any, items: list[SelectedRemoteItem], *, title: str) -> None:
+    table = Table(title=title)
+    table.add_column("Name")
+    table.add_column("Remote Path")
+    table.add_column("Size", justify="right")
+    for item in items[:100]:
+        table.add_row(item.basename, item.remote_path, format_bytes(item.size))
+    if len(items) > 100:
+        table.add_row("...", "...", "...")
+    console.print(table)
+    console.print(f"{len(items)} item(s), {format_bytes(sum(item.size for item in items))}")
+
+
+def _confirm(console: Any, yes: bool, prompt: str) -> None:
+    if yes:
+        return
+    if not typer.confirm(prompt):
+        console.print("Cancelled.", style="muted")
+        raise typer.Exit(code=1)
+
+
+def _parse_upload_targets(items: list[str], has_selectors: bool) -> tuple[list[str], str]:
+    if not items:
+        _error("upload requires source(s) and destination")
+    if has_selectors and len(items) == 1:
+        return ["."], items[0]
+    if len(items) < 2:
+        _error("upload requires source(s) and destination")
+    return items[:-1], items[-1]
+
+
+def _parse_download_targets(items: list[str], has_selectors: bool) -> tuple[list[str], str]:
+    if not items:
+        _error("download requires source(s) and destination")
+    if has_selectors and len(items) == 1:
+        return ["."], items[0]
+    if len(items) < 2:
+        _error("download requires source(s) and destination")
+    return items[:-1], items[-1]
 
 
 @app.callback(invoke_without_command=True)
-def main(
+def cli_callback(
     ctx: typer.Context,
-    whoami: bool = False,
-    logout: bool = False,
-    version: bool = False,
+    version: bool = typer.Option(False, "--version", help="Show version and exit."),
+    whoami: bool = typer.Option(False, "--whoami", help="Show current account info."),
+    logout: bool = typer.Option(False, "--logout", help="Delete cached credentials and token."),
+    theme: str = typer.Option("auto", "--theme", help="Theme: auto/dark/light/plain."),
+    plain: bool = typer.Option(False, "--plain", help="Plain high-compatibility output."),
+    no_color: bool = typer.Option(False, "--no-color", help="Disable colors."),
+    debug: bool = typer.Option(False, "--debug", help="Enable debug logs."),
 ) -> None:
-    """全局回调：处理 --whoami, --logout, --version 和无子命令默认进入 Shell。"""
+    _configure_logging(debug)
+    settings = load_settings()
+    ui = UIOptions(
+        theme_mode=theme if theme != "auto" else settings.theme_mode,
+        plain=plain,
+        no_color=no_color,
+    )
+    ctx.obj = AppState(
+        ui=ui,
+        console=create_console(ui),
+        stderr_console=create_console(ui, stderr=True),
+        settings=settings,
+        debug=debug,
+    )
+    state = _state(ctx)
     if version:
-        console.print(f"[bold cyan]pancli[/bold cyan] v{__version__}")
+        state.console.print(__version__)
         raise typer.Exit()
-
-    if whoami:
-        cfg = load_config()
-        console.print(f"[bold]Host:[/bold] {cfg.host}")
-        console.print(f"[bold]Username:[/bold] {cfg.username or '无'}")
-        if cfg.encrypted:
-            console.print("[bold green]密码:[/bold green] 已加密保存在本地")
-        else:
-            console.print("[bold yellow]密码:[/bold yellow] 未保存")
-        raise typer.Exit()
-
     if logout:
         cfg = load_config()
         cfg.username = None
         cfg.encrypted = None
         cfg.cached_token.token = ""
+        cfg.cached_token.expires = 0
         save_config(cfg)
-        console.print("[green]✓[/green] 已清除本地登录凭据。")
+        state.console.print(f"Removed cached auth from {AUTH_FILE}")
         raise typer.Exit()
-
+    if whoami and ctx.invoked_subcommand is None:
+        whoami_command(ctx, json_output=False)
+        raise typer.Exit()
     if ctx.invoked_subcommand is None:
         from .shell import run_interactive_shell
 
-        run_interactive_shell()
+        run_interactive_shell(ui)
+        raise typer.Exit()
+
+
+@app.command("whoami")
+def whoami_command(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            cfg = load_config()
+            payload = {
+                "host": cfg.host,
+                "username": cfg.username,
+                "home": home,
+                "auth_file": str(AUTH_FILE),
+                "settings_file": str(get_settings_path()),
+            }
+            if json_output:
+                _json_print(payload)
+                return
+            table = Table(title="Current User")
+            table.add_column("Field")
+            table.add_column("Value")
+            for key, value in payload.items():
+                table.add_row(key, str(value or ""))
+            state.console.print(table)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command()
+def config(
+    ctx: typer.Context,
+    action: str = typer.Argument(..., help="show/get/set/reload/path"),
+    key: str | None = typer.Argument(None),
+    value: str | None = typer.Argument(None),
+) -> None:
+    state = _state(ctx)
+    settings = reload_settings() if action == "reload" else load_settings()
+    if action == "show":
+        _json_print(settings.raw)
+        return
+    if action == "path":
+        state.console.print(str(settings.path))
+        return
+    if action == "get":
+        if not key:
+            _error("config get requires a key")
+        state.console.print(str(settings.get(key)))
+        return
+    if action == "set":
+        if not key or value is None:
+            _error("config set requires key and value")
+        settings.set(key, value)
+        settings.save()
+        state.console.print(f"Updated {key}")
+        return
+    if action == "reload":
+        state.console.print("Reloaded settings.")
+        return
+    _error(f"Unknown config action: {action}")
 
 
 @app.command()
 def ls(
-    path: str = ".",
-    human: bool = False,
+    ctx: typer.Context,
+    path: str = typer.Argument(".", help="Remote path."),
+    human: bool = typer.Option(False, "--human", "-h", help="Human readable sizes."),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
 ) -> None:
-    """列出目录内容。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            return
-        home_name = entrydoc[0]["name"]
-
-        if path == ".":
-            path = f"/{home_name}"
-
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if abs_path == "/":
-            for root in entrydoc:
-                console.print(f"[blue]📁[/blue] {root['name']}")
-            return
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-        if info and info.size == -1:
-            dirs, files = await manager.list_dir(docid, by="name")
-            table = Table(
-                title=f"[bold]📂 {abs_path}[/bold]",
-                show_header=True,
-                border_style="dim",
-            )
-            table.add_column("创建者", style="cyan")
-            table.add_column("大小", justify="right", style="green")
-            table.add_column("修改时间", style="yellow")
-            table.add_column("名称", style="white bold")
-
-            for d in dirs:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            if target == "/":
+                entrydoc = await manager.get_entrydoc()
+                if json_output:
+                    _json_print(entrydoc)
+                    return
+                for item in entrydoc:
+                    state.console.print(item["name"], style="path")
+                return
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None:
+                _error(f"Path not found: {target}")
+            if not info.is_dir:
+                _error(f"Not a directory: {target}")
+            dirs, files = await manager.list_dir(info.docid, by="name")
+            payload = {
+                "path": target,
+                "dirs": [item.model_dump(mode="json") for item in dirs],
+                "files": [item.model_dump(mode="json") for item in files],
+            }
+            if json_output:
+                _json_print(payload)
+                return
+            if not dirs and not files:
+                state.console.print("(empty)", style="muted")
+                return
+            table = Table(title=target)
+            table.add_column("Type")
+            table.add_column("Name")
+            table.add_column("Size", justify="right")
+            table.add_column("Modified")
+            for item in dirs:
+                table.add_row("dir", item.name, "-", _fmt_ts(item.modified))
+            for item in files:
                 table.add_row(
-                    d.creator or "",
-                    Text("📁", style="blue"),
-                    _ts_fmt(d.modified),
-                    d.name,
+                    "file",
+                    item.name,
+                    format_bytes(item.size) if human else str(item.size),
+                    _fmt_ts(item.modified),
                 )
-            for f in files:
-                size_str = _sizeof_fmt(f.size) if human else str(f.size)
-                table.add_row(
-                    f.creator or "",
-                    size_str,
-                    _ts_fmt(f.modified),
-                    f.name,
-                )
-            console.print(table)
-        else:
+            state.console.print(table)
+        finally:
             await manager.close()
-            raise typer.Exit(code=1)
 
-        await manager.close()
-
-    asyncio.run(_impl())
+    _run(runner())
 
 
 @app.command()
 def tree(
-    path: str = ".",
-    depth: int = typer.Option(3, "--depth", "-d", help="递归深度"),
+    ctx: typer.Context,
+    path: str = typer.Argument(".", help="Remote path."),
+    depth: int = typer.Option(3, "--depth", "-d"),
 ) -> None:
-    """显示目录树结构。"""
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None or not info.is_dir:
+                _error(f"Not a directory: {target}")
+            root = Tree(target)
 
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            return
-        home_name = entrydoc[0]["name"]
-
-        if path == ".":
-            path = f"/{home_name}"
-
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-        if info and info.size != -1:
-            console.print("[red]不是目录[/red]")
-            await manager.close()
-            return
-
-        async def build_tree(docid: str, node: Tree, current_depth: int) -> None:
-            if current_depth >= depth:
-                return
-            try:
+            async def walk(docid: str, node: Tree, current: int) -> None:
+                if current >= depth:
+                    return
                 dirs, files = await manager.list_dir(docid, by="name")
-                for d in dirs:
-                    sub = node.add(f"[blue]📁 {d.name}[/blue]")
-                    await build_tree(d.docid, sub, current_depth + 1)
-                for f in files:
-                    node.add(f"📄 {f.name} [dim]({_sizeof_fmt(f.size)})[/dim]")
-            except Exception:
-                pass
+                for directory in dirs:
+                    child = node.add(f"{directory.name}/")
+                    await walk(directory.docid, child, current + 1)
+                for file in files:
+                    node.add(f"{file.name} ({format_bytes(file.size)})")
 
-        root = Tree(f"[bold blue]📂 {abs_path}[/bold blue]")
-        await build_tree(docid, root, 0)
-        console.print(root)
-        await manager.close()
+            await walk(info.docid, root, 0)
+            state.console.print(root)
+        finally:
+            await manager.close()
 
-    asyncio.run(_impl())
+    _run(runner())
+
+
+@app.command()
+def stat(
+    ctx: typer.Context,
+    path: str = typer.Argument(..., help="Remote path."),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None:
+                _error(f"Path not found: {target}")
+            meta = await manager.get_file_meta(info.docid)
+            payload = {
+                "path": target,
+                "resource": info.model_dump(mode="json"),
+                "metadata": meta.model_dump(mode="json"),
+            }
+            if json_output:
+                _json_print(payload)
+                return
+            table = Table(title=target)
+            table.add_column("Field")
+            table.add_column("Value")
+            table.add_row("docid", meta.docid)
+            table.add_row("name", meta.name)
+            table.add_row("size", format_bytes(meta.size))
+            table.add_row("modified", _fmt_ts(meta.modified))
+            table.add_row("client_mtime", _fmt_ts(meta.client_mtime))
+            table.add_row("editor", meta.editor or "-")
+            table.add_row("rev", meta.rev or "-")
+            table.add_row("tags", ", ".join(meta.tags) if meta.tags else "-")
+            state.console.print(table)
+        finally:
+            await manager.close()
+
+    _run(runner())
 
 
 @app.command()
 def find(
-    keyword: str = typer.Argument(..., help="搜索关键词"),
-    path: str = typer.Option(".", "--path", "-p", help="搜索根路径"),
-    depth: int = typer.Option(3, "--depth", "-d", help="递归深度"),
+    ctx: typer.Context,
+    keyword: str = typer.Argument(...),
+    path: str = typer.Option(".", "--path", "-p"),
+    depth: int | None = typer.Option(None, "--depth", "-d"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
 ) -> None:
-    """全局搜索文件。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            return
-        home_name = entrydoc[0]["name"]
-
-        if path == ".":
-            path = f"/{home_name}"
-
-        console.print(f"[cyan]🔍 搜索关键词:[/cyan] [bold]{keyword}[/bold]")
-        console.print(f"[cyan]📂 搜索路径:[/cyan] [bold]{path}[/bold]")
-        console.print()
-
-        results = await manager.search(path, keyword, max_depth=depth)
-
-        if not results:
-            console.print("[yellow]未找到匹配结果[/yellow]")
-            await manager.close()
-            return
-
-        table = Table(
-            title=f"[bold]搜索结果 ({len(results)} 项)[/bold]",
-            show_header=True,
-            border_style="dim",
-        )
-        table.add_column("类型", width=6, style="cyan")
-        table.add_column("名称", style="white bold")
-        table.add_column("路径", style="dim")
-        table.add_column("大小", justify="right", style="green")
-        table.add_column("修改时间", style="yellow")
-
-        for r in results:
-            icon = "[blue]📁[/blue]" if r.is_dir else "[white]📄[/white]"
-            table.add_row(
-                icon,
-                r.name,
-                r.path,
-                _sizeof_fmt(r.size) if not r.is_dir else "—",
-                _ts_fmt(r.modified),
-            )
-
-        console.print(table)
-        await manager.close()
-
-    asyncio.run(_impl())
-
-
-@app.command()
-def stat(path: str = typer.Argument(..., help="文件或目录路径")) -> None:
-    """查看文件/目录元信息。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            return
-        home_name = entrydoc[0]["name"]
-
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-        if not info:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        meta = await manager.get_file_meta(docid)
-
-        panel_table = Table(
-            title=f"📄 {abs_path}",
-            show_header=False,
-            border_style="dim",
-            box=None,
-        )
-        panel_table.add_column("Key", style="cyan bold")
-        panel_table.add_column("Value")
-
-        panel_table.add_row("DocID", meta.docid)
-        panel_table.add_row("大小", _sizeof_fmt(meta.size))
-        panel_table.add_row("类型", "目录" if info.size == -1 else "文件")
-        panel_table.add_row("修改时间", _ts_fmt(meta.modified))
-        panel_table.add_row("客户端修改时间", _ts_fmt(meta.client_mtime))
-        panel_table.add_row("编辑者", meta.editor or "—")
-        panel_table.add_row("标签", ", ".join(meta.tags) if meta.tags else "—")
-        panel_table.add_row("版本", meta.rev or "—")
-
-        console.print(panel_table)
-        await manager.close()
-
-    asyncio.run(_impl())
-
-
-@app.command()
-def mkdir(
-    path: str = typer.Argument(..., help="要创建的目录路径"),
-) -> None:
-    """创建目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
         try:
-            docid = await manager.create_dirs_by_path(path.strip("/"))
-            console.print(f"[green]✓[/green] 创建成功: {path}")
-        except InvalidRootException:
-            console.print("[red]无效根目录[/red]")
+            target = _normalize_remote_path(path, home)
+            results = await manager.search(target, keyword, max_depth=depth or state.settings.search_depth)
+            payload = [item.model_dump(mode="json") for item in results]
+            if json_output:
+                _json_print(payload)
+                return
+            if not results:
+                state.console.print("No matches.", style="warning")
+                raise typer.Exit(code=1)
+            table = Table(title=f"find {keyword}")
+            table.add_column("Type")
+            table.add_column("Path")
+            table.add_column("Size", justify="right")
+            table.add_column("Modified")
+            for item in results:
+                table.add_row(
+                    "dir" if item.is_dir else "file",
+                    item.path,
+                    "-" if item.is_dir else format_bytes(item.size),
+                    _fmt_ts(item.modified),
+                )
+            state.console.print(table)
         finally:
             await manager.close()
 
-    asyncio.run(_impl())
+    _run(runner())
+
+
+@app.command(name="search")
+def search_command(
+    ctx: typer.Context,
+    keyword: str = typer.Argument(...),
+    path: str = typer.Option(".", "--path", "-p"),
+    depth: int | None = typer.Option(None, "--depth", "-d"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    find(ctx, keyword, path, depth, json_output)
+
+
+@app.command()
+def quota(
+    ctx: typer.Context,
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, _ = await _with_manager(ctx)
+        try:
+            quota_info = await manager.get_quota()
+            payload = quota_info.model_dump(mode="json")
+            if json_output:
+                _json_print(payload)
+                return
+            table = Table(title="Quota")
+            table.add_column("Field")
+            table.add_column("Value")
+            table.add_row("used", format_bytes(quota_info.quota_used))
+            table.add_row("allocated", format_bytes(quota_info.quota_allocated))
+            table.add_row("rate", quota_info.space_rate or "-")
+            state.console.print(table)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command()
+def mkdir(ctx: typer.Context, path: str = typer.Argument(...)) -> None:
+    async def runner() -> None:
+        manager, home = await _with_manager(ctx)
+        try:
+            await manager.create_dirs_by_path(_normalize_remote_path(path, home).strip("/"))
+        except InvalidRootException as exc:
+            _error(str(exc))
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command()
+def touch(ctx: typer.Context, path: str = typer.Argument(...)) -> None:
+    async def runner() -> None:
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            parent = "/".join(target.strip("/").split("/")[:-1])
+            name = target.strip("/").split("/")[-1]
+            parent_id = await manager.create_dirs_by_path(parent)
+            await manager.upload_file(parent_id, name, b"", stream_len=0)
+        finally:
+            await manager.close()
+
+    _run(runner())
 
 
 @app.command()
 def rm(
-    path: str = typer.Argument(..., help="要删除的路径"),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="递归删除目录"),
+    ctx: typer.Context,
+    path: str = typer.Argument(...),
+    recursive: bool = typer.Option(False, "--recursive", "-r"),
 ) -> None:
-    """删除文件或目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
+    async def runner() -> None:
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None:
+                _error(f"Path not found: {target}")
+            if info.is_dir:
+                if not recursive:
+                    _error("Directory removal needs --recursive")
+                await manager.delete_dir(info.docid)
+            else:
+                await manager.delete_file(info.docid)
+        finally:
             await manager.close()
+
+    _run(runner())
+
+
+async def _move_or_copy(ctx: typer.Context, src: str, dst: str, *, force: bool, copy: bool) -> None:
+    manager, home = await _with_manager(ctx)
+    try:
+        src_path = _normalize_remote_path(src, home)
+        dst_path = _normalize_remote_path(dst, home)
+        src_info = await manager.get_resource_info_by_path(src_path.strip("/"))
+        if src_info is None:
+            _error(f"Source not found: {src_path}")
+        dst_info = await manager.get_resource_info_by_path(dst_path.strip("/"))
+        op = manager.copy_file if copy else manager.move_file
+        if dst_info and dst_info.is_dir:
+            await op(src_info.docid, dst_info.docid, overwrite_on_dup=force)
             return
-        home_name = entrydoc[0]["name"]
-
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-        if not info:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        if info.size == -1:
-            if not recursive:
-                console.print("[yellow]是目录，请使用 -r 递归删除[/yellow]")
-                await manager.close()
-                return
-            await manager.delete_dir(info.docid)
-        else:
-            await manager.delete_file(info.docid)
-
-        console.print(f"[green]✓[/green] 删除成功: {abs_path}")
+        dst_parent = "/".join(dst_path.strip("/").split("/")[:-1])
+        dst_name = dst_path.strip("/").split("/")[-1]
+        parent_info = await manager.get_resource_info_by_path(dst_parent)
+        if parent_info is None:
+            _error(f"Destination parent not found: {dst_parent}")
+        if dst_info and not force:
+            _error(f"Destination exists: {dst_path}")
+        if dst_info and force:
+            await manager.delete_file(dst_info.docid)
+        new_id, new_name = await op(src_info.docid, parent_info.docid, rename_on_dup=True)
+        if new_name != dst_name:
+            await manager.rename_file(new_id, dst_name)
+    finally:
         await manager.close()
-
-    asyncio.run(_impl())
 
 
 @app.command()
 def mv(
-    src: str = typer.Argument(..., help="源路径"),
-    dst: str = typer.Argument(..., help="目标路径"),
-    force: bool = typer.Option(False, "--force", "-f", help="覆盖已存在的目标"),
+    ctx: typer.Context,
+    src: str = typer.Argument(...),
+    dst: str = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", "-f"),
 ) -> None:
-    """移动或重命名文件/目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
-
-        src_abs, src_docid = await resolve_path(manager, src, home_name)
-        dst_abs, dst_docid = await resolve_path(manager, dst, home_name)
-
-        if src_docid is None:
-            console.print(f"[red]源路径不存在:[/red] {src_abs}")
-            await manager.close()
-            return
-
-        src_info = await manager.get_resource_info_by_path(src_abs.strip("/"))
-        dst_info = await manager.get_resource_info_by_path(dst_abs.strip("/"))
-
-        if dst_info and dst_info.size == -1:
-            if force:
-                await manager.move_file(src_info.docid, dst_info.docid, overwrite_on_dup=True)
-            else:
-                await manager.move_file(src_info.docid, dst_info.docid)
-            console.print(f"[green]✓[/green] 移动完成: {src_abs} → {dst_abs}")
-        elif dst_info is None:
-            dst_parts = dst_abs.strip("/").split("/")
-            dst_name = dst_parts[-1]
-            dst_parent = "/".join(dst_parts[:-1])
-            dst_parent_info = await manager.get_resource_info_by_path(dst_parent)
-            if dst_parent_info:
-                new_id, new_name = await manager.move_file(
-                    src_info.docid, dst_parent_info.docid, rename_on_dup=True
-                )
-                if new_name != dst_name:
-                    await manager.rename_file(new_id, dst_name)
-                console.print(f"[green]✓[/green] 重命名完成: {src_abs} → {dst_abs}")
-        else:
-            if not force:
-                console.print(f"[yellow]{dst_abs} 已存在，使用 -f 覆盖[/yellow]")
-                await manager.close()
-                return
-            await manager.delete_file(dst_info.docid)
-            dst_parts = dst_abs.strip("/").split("/")
-            dst_name = dst_parts[-1]
-            dst_parent = "/".join(dst_parts[:-1])
-            dst_parent_info = await manager.get_resource_info_by_path(dst_parent)
-            if dst_parent_info:
-                new_id, new_name = await manager.move_file(
-                    src_info.docid, dst_parent_info.docid, rename_on_dup=True
-                )
-                if new_name != dst_name:
-                    await manager.rename_file(new_id, dst_name)
-                console.print(f"[green]✓[/green] 移动并覆盖完成: {src_abs} → {dst_abs}")
-
-        await manager.close()
-
-    asyncio.run(_impl())
+    _run(_move_or_copy(ctx, src, dst, force=force, copy=False))
 
 
 @app.command()
 def cp(
-    src: str = typer.Argument(..., help="源路径"),
-    dst: str = typer.Argument(..., help="目标路径"),
-    force: bool = typer.Option(False, "--force", "-f", help="覆盖已存在的目标"),
+    ctx: typer.Context,
+    src: str = typer.Argument(...),
+    dst: str = typer.Argument(...),
+    force: bool = typer.Option(False, "--force", "-f"),
 ) -> None:
-    """复制文件/目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
-
-        src_abs, src_docid = await resolve_path(manager, src, home_name)
-        dst_abs, dst_docid = await resolve_path(manager, dst, home_name)
-
-        if src_docid is None:
-            console.print(f"[red]源路径不存在:[/red] {src_abs}")
-            await manager.close()
-            return
-
-        src_info = await manager.get_resource_info_by_path(src_abs.strip("/"))
-        dst_info = await manager.get_resource_info_by_path(dst_abs.strip("/"))
-
-        if dst_info and dst_info.size == -1:
-            await manager.copy_file(src_info.docid, dst_info.docid, overwrite_on_dup=force)
-            console.print(f"[green]✓[/green] 复制完成: {src_abs} → {dst_abs}")
-        elif dst_info is None:
-            dst_parts = dst_abs.strip("/").split("/")
-            dst_name = dst_parts[-1]
-            dst_parent = "/".join(dst_parts[:-1])
-            dst_parent_info = await manager.get_resource_info_by_path(dst_parent)
-            if dst_parent_info:
-                new_id, new_name = await manager.copy_file(
-                    src_info.docid, dst_parent_info.docid, rename_on_dup=True
-                )
-                if new_name != dst_name:
-                    await manager.rename_file(new_id, dst_name)
-                console.print(f"[green]✓[/green] 复制完成: {src_abs} → {dst_abs}")
-        else:
-            if not force:
-                console.print(f"[yellow]{dst_abs} 已存在，使用 -f 覆盖[/yellow]")
-                await manager.close()
-                return
-            await manager.delete_file(dst_info.docid)
-            dst_parts = dst_abs.strip("/").split("/")
-            dst_name = dst_parts[-1]
-            dst_parent = "/".join(dst_parts[:-1])
-            dst_parent_info = await manager.get_resource_info_by_path(dst_parent)
-            if dst_parent_info:
-                new_id, new_name = await manager.copy_file(
-                    src_info.docid, dst_parent_info.docid, rename_on_dup=True
-                )
-                if new_name != dst_name:
-                    await manager.rename_file(new_id, dst_name)
-                console.print(f"[green]✓[/green] 复制并覆盖完成: {src_abs} → {dst_abs}")
-
-        await manager.close()
-
-    asyncio.run(_impl())
-
-
-@app.command()
-def download(
-    remote: str = typer.Argument(..., help="远程路径"),
-    local: str = typer.Argument(".", help="本地保存目录"),
-    jobs: int = typer.Option(4, "--jobs", "-j", help="并发数"),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="递归下载目录"),
-) -> None:
-    """下载文件或目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
-
-        abs_path, docid = await resolve_path(manager, remote, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-
-        if info and info.size != -1:
-            local_path = Path(local)
-            if local_path.is_dir():
-                dest = local_path / info.name
-            else:
-                dest = local_path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-
-            local_size = dest.stat().st_size if dest.exists() else 0
-            headers = {}
-            mode = "ab" if local_size > 0 else "wb"
-
-            if local_size < info.size:
-                headers["Range"] = f"bytes={local_size}-"
-                console.print(f"[yellow]检测到断点续传，已下载 {local_size} bytes[/yellow]")
-
-            url, _ = await manager.get_download_url(info.docid)
-            downloaded = local_size
-            start_time = time.time()
-
-            with open(dest, mode) as f:
-                from . import network
-
-                async for chunk in network.async_stream_download(
-                    url, headers=headers, client=manager._client
-                ):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    elapsed = time.time() - start_time
-                    speed = downloaded / elapsed if elapsed > 0 else 0
-                    progress = downloaded / info.size * 100
-                    console.print(
-                        f"\r[cyan]⬇ {info.name}[/cyan] [{progress:.1f}%] {_sizeof_fmt(speed)}/s",
-                        end="",
-                    )
-
-            console.print()
-            console.print(f"[green]✓[/green] 下载完成: {dest}")
-        else:
-            if not recursive:
-                console.print(f"[yellow]{abs_path} 是目录，请使用 -r 递归下载[/yellow]")
-                await manager.close()
-                return
-
-            dirs, files = await manager.list_dir(docid, by="name")
-            tasks: list[TransferTask] = []
-            base_local = Path(local) / info.name
-            base_local.mkdir(parents=True, exist_ok=True)
-
-            async def collect_tasks(parent_id: str, parent_remote: str, parent_local: Path) -> None:
-                dirs2, files2 = await manager.list_dir(parent_id, by="name")
-                for d in dirs2:
-                    sub_dir = parent_local / d.name
-                    sub_dir.mkdir(exist_ok=True)
-                    await collect_tasks(d.docid, f"{parent_remote}/{d.name}", sub_dir)
-                for f in files2:
-                    file_info = await manager.get_resource_info_by_path(
-                        f"{parent_remote}/{f.name}".strip("/")
-                    )
-                    if file_info:
-                        tasks.append(
-                            TransferTask(
-                                remote_path=f"{parent_remote}/{f.name}",
-                                local_path=str(parent_local / f.name),
-                                size=file_info.size,
-                                docid=file_info.docid,
-                            )
-                        )
-
-            await collect_tasks(docid, abs_path, base_local)
-
-            if tasks:
-                console.print(f"[cyan]准备下载 {len(tasks)} 个文件，并发数 {jobs}[/cyan]")
-                await batch_download(manager, tasks, jobs=jobs)
-
-            console.print(f"[green]✓[/green] 目录下载完成: {base_local}")
-
-        await manager.close()
-
-    asyncio.run(_impl())
-
-
-@app.command()
-def upload(
-    local: str = typer.Argument(..., help="本地路径"),
-    remote: str = typer.Argument(".", help="远程目录"),
-    jobs: int = typer.Option(4, "--jobs", "-j", help="并发数"),
-    recursive: bool = typer.Option(False, "--recursive", "-r", help="递归上传目录"),
-) -> None:
-    """上传文件或目录。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
-
-        if not os.path.exists(local):
-            console.print(f"[red]本地路径不存在:[/red] {local}")
-            await manager.close()
-            return
-
-        local_path_obj = Path(local)
-        local_name = local_path_obj.name
-
-        if remote == ".":
-            remote_dir = f"/{home_name}"
-        else:
-            remote_dir = remote
-
-        remote_dir_stripped = remote_dir.strip("/")
-
-        if os.path.isfile(local):
-            dir_id = await manager.create_dirs_by_path(remote_dir_stripped)
-            file_size = local_path_obj.stat().st_size
-            start_time = time.time()
-            uploaded = 0
-
-            with open(local, "rb") as f:
-                content = f.read()
-
-            console.print(f"[dim]上传中...[/dim] {local_name} ({_sizeof_fmt(file_size)})")
-
-            class ProgressReader:
-                def __init__(self, fp, start):
-                    self._fp = fp
-                    self._start = start
-
-                def read(self, size: int = -1) -> bytes:
-                    nonlocal uploaded
-                    data = self._fp.read(size)
-                    if data:
-                        uploaded += len(data)
-                        elapsed = time.time() - self._start
-                        speed = uploaded / elapsed if elapsed > 0 else 0
-                        progress = uploaded / file_size * 100 if file_size > 0 else 0
-                        console.print(
-                            f"\r[magenta]⬆ {local_name}[/magenta] [{progress:.1f}%] {_sizeof_fmt(speed)}/s",
-                            end="",
-                        )
-                    return data
-
-            reader = ProgressReader(open(local, "rb"), start_time)
-            try:
-                await manager.upload_file(dir_id, local_name, reader, stream_len=file_size)
-            finally:
-                reader._fp.close()
-
-            console.print()
-            console.print(f"[green]✓[/green] 上传完成: {remote_dir}/{local_name}")
-        else:
-            if not recursive:
-                console.print(f"[yellow]{local} 是目录，请使用 -r 递归上传[/yellow]")
-                await manager.close()
-                return
-
-            tasks: list[TransferTask] = []
-
-            async def collect_tasks(parent_local: Path, parent_remote: str) -> None:
-                for entry in parent_local.iterdir():
-                    rel_remote = f"{parent_remote}/{entry.name}"
-                    if entry.is_file():
-                        tasks.append(
-                            TransferTask(
-                                remote_path=rel_remote,
-                                local_path=str(entry),
-                                size=entry.stat().st_size,
-                            )
-                        )
-                    elif entry.is_dir():
-                        sub_dir_id = await manager.create_dirs_by_path(rel_remote.strip("/"))
-                        await collect_tasks(entry, rel_remote)
-
-            await collect_tasks(local_path_obj, remote_dir_stripped + "/" + local_name)
-
-            if tasks:
-                console.print(f"[cyan]准备上传 {len(tasks)} 个文件，并发数 {jobs}[/cyan]")
-                dir_id = await manager.create_dirs_by_path(remote_dir_stripped)
-                await batch_upload(manager, tasks, dir_id, jobs=jobs)
-
-            console.print(f"[green]✓[/green] 目录上传完成: {remote_dir}/{local_name}")
-
-        await manager.close()
-
-    asyncio.run(_impl())
+    _run(_move_or_copy(ctx, src, dst, force=force, copy=True))
 
 
 @app.command()
 def cat(
-    path: str = typer.Argument(..., help="文件路径"),
-    head: int = typer.Option(0, "--head", help="只显示前 N 行"),
-    tail: int = typer.Option(0, "--tail", help="只显示后 N 行"),
+    ctx: typer.Context,
+    path: str = typer.Argument(...),
+    head: int = typer.Option(0, "--head"),
+    tail: int = typer.Option(0, "--tail"),
 ) -> None:
-    """查看文件内容。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
-            await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
-
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        info = await manager.get_resource_info_by_path(abs_path.strip("/"))
-        if not info or info.size == -1:
-            console.print(f"[red]不是文件:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        if head > 0:
-            count = 0
-            lines_buffer: list[bytes] = []
+    async def runner() -> None:
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None or info.is_dir:
+                _error(f"Not a file: {target}")
+            data = bytearray()
             async for chunk in manager.download_file_stream(info.docid):
-                lines = chunk.split(b"\n")
-                for i, line in enumerate(lines):
-                    if i < len(lines) - 1:
-                        lines_buffer.append(line)
-                        count += 1
-                        if count >= head:
-                            break
-                    else:
-                        lines_buffer.append(line)
-                if count >= head:
-                    break
-            for line in lines_buffer[:head]:
-                sys.stdout.buffer.write(line + b"\n")
-        elif tail > 0:
-            import collections
-
-            window = collections.deque(maxlen=tail)
-            buffer = b""
-            async for chunk in manager.download_file_stream(info.docid):
-                buffer += chunk
-                while b"\n" in buffer:
-                    line, buffer = buffer.split(b"\n", 1)
-                    window.append(line)
-            if buffer:
-                window.append(buffer)
-            for line in window:
-                sys.stdout.buffer.write(line + b"\n")
-        else:
-            read = 0
-            try:
-                async for chunk in manager.download_file_stream(info.docid):
-                    sys.stdout.buffer.write(chunk)
-                    read += len(chunk)
-                sys.stdout.buffer.flush()
-            except BrokenPipeError:
-                pass
-
-        await manager.close()
-
-    asyncio.run(_impl())
-
-
-@app.command()
-def touch(
-    path: str = typer.Argument(..., help="文件路径"),
-) -> None:
-    """创建空文件。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
+                data.extend(chunk)
+            lines = data.decode("utf-8", errors="replace").splitlines()
+            if head > 0:
+                lines = lines[:head]
+            elif tail > 0:
+                lines = lines[-tail:]
+            typer.echo("\n".join(lines))
+        finally:
             await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
 
-        abs_path, _ = await resolve_path(manager, path, home_name)
-        parts = abs_path.strip("/").split("/")
-        parent = "/".join(parts[:-1]) or f"/{home_name}"
-        name = parts[-1]
-
-        parent_info = await manager.get_resource_info_by_path(parent.strip("/"))
-        if parent_info:
-            pdocid = parent_info.docid
-        else:
-            pdocid = await manager.create_dirs_by_path(parent.strip("/"))
-
-        await manager.upload_file(pdocid, name, b"")
-        console.print(f"[green]✓[/green] 文件建立: {abs_path}")
-        await manager.close()
-
-    asyncio.run(_impl())
+    _run(runner())
 
 
 @app.command()
 def link(
-    path: str = typer.Argument(..., help="文件路径"),
-    create: bool = typer.Option(False, "--create", "-c", help="创建外链"),
-    delete: bool = typer.Option(False, "--delete", "-d", help="删除外链"),
-    expire: int = typer.Option(0, "--expire", "-e", help="过期时间（Unix 时间戳）"),
-    password: bool = typer.Option(False, "--password", "-p", help="启用密码保护"),
+    ctx: typer.Context,
+    path: str = typer.Argument(...),
+    create: bool = typer.Option(False, "--create", "-c"),
+    delete: bool = typer.Option(False, "--delete", "-d"),
+    expire: int = typer.Option(0, "--expire", "-e"),
+    password: bool = typer.Option(False, "--password", "-p"),
 ) -> None:
-    """管理外链。"""
-
-    async def _impl() -> None:
-        cfg = load_config()
-        manager = await _login(cfg)
-
-        entrydoc = await manager.get_entrydoc()
-        if not entrydoc:
-            console.print("[red]无法获取文档库根目录[/red]")
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None:
+                _error(f"Path not found: {target}")
+            if create:
+                result = await manager.create_link(info.docid, end_time=expire or None, enable_pass=password)
+                state.console.print(result.link)
+                if result.password:
+                    state.console.print(f"password: {result.password}")
+                return
+            if delete:
+                await manager.delete_link(info.docid)
+                return
+            result = await manager.get_link(info.docid)
+            if result is None:
+                _error("No link exists for this path.")
+            state.console.print(result.link)
+            if result.password:
+                state.console.print(f"password: {result.password}")
+        finally:
             await manager.close()
-            return
-        home_name = entrydoc[0]["name"]
 
-        abs_path, docid = await resolve_path(manager, path, home_name)
-
-        if docid is None:
-            console.print(f"[red]不存在:[/red] {abs_path}")
-            await manager.close()
-            return
-
-        if create:
-            link_info = await manager.create_link(
-                docid,
-                end_time=expire if expire > 0 else None,
-                enable_pass=password,
-            )
-            console.print(f"[green]✓[/green] 外链创建成功:")
-            console.print(f"[cyan]链接:[/cyan] {link_info.link}")
-            if link_info.password:
-                console.print(f"[cyan]密码:[/cyan] {link_info.password}")
-        elif delete:
-            await manager.delete_link(docid)
-            console.print(f"[green]✓[/green] 外链已删除")
-        else:
-            link_info = await manager.get_link(docid)
-            if link_info:
-                console.print(f"[cyan]链接:[/cyan] {link_info.link}")
-                if link_info.password:
-                    console.print(f"[cyan]密码:[/cyan] {link_info.password}")
-                console.print(f"[cyan]权限:[/cyan] {link_info.perm}")
-            else:
-                console.print("[yellow]该文件没有外链[/yellow]")
-
-        await manager.close()
-
-    asyncio.run(_impl())
+    _run(runner())
 
 
 @app.command()
-def shell() -> None:
-    """进入交互式 REPL Shell。"""
+def upload(
+    ctx: typer.Context,
+    items: list[str] = typer.Argument(..., help="Sources followed by remote destination."),
+    glob_patterns: list[str] = typer.Option([], "--glob", help="Glob pattern to filter local files."),
+    regex: str | None = typer.Option(None, "--regex", help="Regex pattern to filter local files."),
+    exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern."),
+    recursive: bool = typer.Option(False, "--recursive", "-r"),
+    jobs: int | None = typer.Option(None, "--jobs", "-j"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    match_field: MatchField = typer.Option(MatchField.BASENAME, "--match-field"),
+) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            sources, remote = _parse_upload_targets(items, bool(glob_patterns or regex or exclude or recursive))
+            if not (glob_patterns or regex or exclude):
+                for source in sources:
+                    if Path(source).expanduser().is_dir() and not recursive:
+                        _error(f"Directory upload needs --recursive: {source}")
+            remote_dir = _normalize_remote_path(remote, home)
+            selected = select_local_files(
+                sources,
+                globs=glob_patterns,
+                regex=regex,
+                excludes=exclude,
+                recursive=recursive or bool(glob_patterns or regex or exclude),
+                match_field=match_field,
+            )
+            if not selected:
+                _error("No local files matched.")
+            _preview_local(state.console, selected, title="Upload Preview")
+            _confirm(state.console, yes, "Continue upload?")
+            tasks: list[TransferTask] = []
+            for item in selected:
+                remote_path = f"{remote_dir.rstrip('/')}/{item.relative_path.replace('\\', '/')}"
+                parent = "/".join(remote_path.strip("/").split("/")[:-1])
+                parent_id = await manager.create_dirs_by_path(parent)
+                tasks.append(
+                    TransferTask(
+                        remote_path=remote_path,
+                        local_path=item.source_path,
+                        size=item.size,
+                        docid=parent_id,
+                    )
+                )
+            await batch_upload(manager, tasks, jobs=jobs or state.settings.default_jobs, console=state.console)
+            failed = [task for task in tasks if task.status == TransferStatus.FAILED]
+            if failed:
+                for task in failed:
+                    state.stderr_console.print(f"FAILED {task.local_path}: {task.error}")
+                raise typer.Exit(code=1)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command()
+def download(
+    ctx: typer.Context,
+    items: list[str] = typer.Argument(..., help="Remote source(s) followed by local destination."),
+    glob_patterns: list[str] = typer.Option([], "--glob", help="Glob pattern to filter remote files."),
+    regex: str | None = typer.Option(None, "--regex", help="Regex pattern to filter remote files."),
+    exclude: list[str] = typer.Option([], "--exclude", help="Glob exclude pattern."),
+    recursive: bool = typer.Option(False, "--recursive", "-r"),
+    search: bool = typer.Option(False, "--search", help="Prefer search mode when available."),
+    range_scan: bool = typer.Option(False, "--range", help="Treat remote arguments as search roots."),
+    jobs: int | None = typer.Option(None, "--jobs", "-j"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    match_field: MatchField = typer.Option(MatchField.BASENAME, "--match-field"),
+) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            selector_mode = bool(glob_patterns or regex or exclude or search or range_scan)
+            roots, dest = _parse_download_targets(
+                items,
+                bool(glob_patterns or regex or exclude or recursive or search or range_scan),
+            )
+            dest_dir = Path(dest).expanduser().resolve()
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            normalized_roots = [_normalize_remote_path(root, home) for root in roots]
+            if not selector_mode and not recursive:
+                for root in normalized_roots:
+                    info = await manager.get_resource_info_by_path(root.strip("/"))
+                    if info and info.is_dir:
+                        _error(f"Directory download needs --recursive: {root}")
+            remote_items: list[SelectedRemoteItem] = []
+            for root in normalized_roots:
+                remote_items.extend(
+                    await _collect_remote_items(
+                        manager,
+                        root,
+                        recursive=recursive or range_scan or bool(glob_patterns or regex),
+                    )
+                )
+            if glob_patterns or regex or exclude:
+                remote_items = filter_remote_items(
+                    remote_items,
+                    globs=glob_patterns,
+                    regex=regex,
+                    excludes=exclude,
+                    match_field=match_field,
+                )
+            if search and not remote_items:
+                state.stderr_console.print("Search mode fallback did not find any items.")
+            if not remote_items:
+                _error("No remote files matched.")
+            _preview_remote(state.console, remote_items, title="Download Preview")
+            _confirm(state.console, yes, "Continue download?")
+            tasks = [
+                TransferTask(
+                    remote_path=item.remote_path,
+                    local_path=str(dest_dir / item.relative_path),
+                    size=item.size,
+                    docid=item.docid,
+                )
+                for item in remote_items
+            ]
+            await batch_download(manager, tasks, jobs=jobs or state.settings.default_jobs, console=state.console)
+            failed = [task for task in tasks if task.status == TransferStatus.FAILED]
+            if failed:
+                for task in failed:
+                    state.stderr_console.print(f"FAILED {task.remote_path}: {task.error}")
+                raise typer.Exit(code=1)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command()
+def revisions(ctx: typer.Context, path: str = typer.Argument(...)) -> None:
+    async def runner() -> None:
+        state = _state(ctx)
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None or info.is_dir:
+                _error(f"Not a file: {target}")
+            revision_items = await manager.get_revisions(info.docid)
+            table = Table(title=f"Revisions: {target}")
+            table.add_column("rev")
+            table.add_column("size", justify="right")
+            table.add_column("modified")
+            table.add_column("editor")
+            for item in revision_items:
+                table.add_row(item.rev, format_bytes(item.size), _fmt_ts(item.modified), item.editor or "-")
+            state.console.print(table)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@app.command("restore-revision")
+def restore_revision(
+    ctx: typer.Context,
+    path: str = typer.Argument(...),
+    rev: str = typer.Argument(...),
+) -> None:
+    async def runner() -> None:
+        manager, home = await _with_manager(ctx)
+        try:
+            target = _normalize_remote_path(path, home)
+            info = await manager.get_resource_info_by_path(target.strip("/"))
+            if info is None or info.is_dir:
+                _error(f"Not a file: {target}")
+            await manager.restore_revision(info.docid, rev)
+        finally:
+            await manager.close()
+
+    _run(runner())
+
+
+@trash_app.command("ls")
+def trash_ls() -> None:
+    _error("Trash list is not implemented yet.", code=2)
+
+
+@trash_app.command("restore")
+def trash_restore() -> None:
+    _error("Trash restore is not implemented yet.", code=2)
+
+
+@trash_app.command("rm")
+def trash_rm() -> None:
+    _error("Trash remove is not implemented yet.", code=2)
+
+
+@app.command()
+def shell(ctx: typer.Context) -> None:
     from .shell import run_interactive_shell
 
-    run_interactive_shell()
+    run_interactive_shell(_state(ctx).ui)
 
 
-def cli() -> None:
-    """入口函数（兼容旧版本）。"""
+def main() -> None:
     app()
 
 
+def cli() -> None:
+    main()
+
+
 if __name__ == "__main__":
-    cli()
+    main()

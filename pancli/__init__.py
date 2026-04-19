@@ -1,3 +1,5 @@
-"""BHPAN CLI — 北航网盘命令行工具 v3."""
+"""PanCLI package."""
 
-__version__ = "3.0.0"
+from .version import __version__
+
+__all__ = ["__version__"]
