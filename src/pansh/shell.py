@@ -11,6 +11,8 @@ from pathlib import Path
 import click
 import typer
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import InMemoryHistory
 from rich.console import Group
 from rich.panel import Panel
@@ -40,7 +42,7 @@ INTERACTIVE_COMMANDS = [
     ("lpwd", "显示当前本地目录。"),
     ("lcd [路径]", "切换当前本地目录。"),
     ("lls [路径]", "列出本地文件。"),
-    ("!<command>", "执行本地 shell command。"),
+    ("!<command>", "执行本地 shell command；!cd 会同步更新本地工作目录。"),
 ]
 
 VISIBLE_COMMANDS = [
@@ -49,7 +51,7 @@ VISIBLE_COMMANDS = [
     ("config ...", "查看或修改本地设置。"),
     ("ls [路径]", "列出远端目录内容。"),
     ("tree [路径]", "以树形方式显示远端目录。"),
-    ("stat <路径>", "查看文件或目录的元数据。"),
+    ("stat <路径>", "查看文件或目录元数据。"),
     ("find <keyword>", "在远端路径下按名称查找。"),
     ("mkdir <路径>", "创建远端目录。"),
     ("touch <路径>", "创建空文件。"),
@@ -61,6 +63,107 @@ VISIBLE_COMMANDS = [
     ("download ...", "下载文件；默认目标是当前本地目录。"),
 ]
 
+COMMAND_NAMES = sorted({item[0].split()[0] for item in INTERACTIVE_COMMANDS + VISIBLE_COMMANDS})
+LOCAL_SHELL_COMMANDS = ("cd", "dir", "ls", "pwd")
+
+
+def _append_sep(path: Path, text: str) -> str:
+    if path.is_dir() and not text.endswith(("/", "\\")):
+        return text + os.sep
+    return text
+
+
+class LocalPathCompleter(Completer):
+    def __init__(self, shell: "PanShell") -> None:
+        self.shell = shell
+
+    def _iter_local_matches(self, raw: str, *, directories_only: bool) -> list[Completion]:
+        base = Path(self.shell.local_cwd)
+        expanded = Path(raw).expanduser()
+        candidate = expanded if expanded.is_absolute() else base / expanded
+        parent = candidate if raw.endswith(("/", "\\")) else candidate.parent
+        prefix = "" if raw.endswith(("/", "\\")) else candidate.name
+        try:
+            parent = parent.resolve()
+        except OSError:
+            return []
+        if not parent.exists() or not parent.is_dir():
+            return []
+        results: list[Completion] = []
+        for entry in sorted(parent.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())):
+            if directories_only and not entry.is_dir():
+                continue
+            if prefix and not entry.name.lower().startswith(prefix.lower()):
+                continue
+            display = _append_sep(entry, entry.name)
+            start_position = -len(prefix)
+            results.append(Completion(display, start_position=start_position, display=display))
+        return results
+
+    def _yield_command_completions(self, current: str):
+        for name in COMMAND_NAMES:
+            if name.startswith(current):
+                yield Completion(name, start_position=-len(current), display=name)
+
+    def _yield_local_dir_completions(self, current: str):
+        for item in self._iter_local_matches(current, directories_only=True):
+            yield item
+
+    def _yield_local_path_completions(self, current: str):
+        for item in self._iter_local_matches(current, directories_only=False):
+            yield item
+
+    def get_completions(self, document: Document, complete_event):
+        text = document.text_before_cursor
+        stripped = text.lstrip()
+        if not stripped:
+            yield from self._yield_local_dir_completions("")
+            yield from self._yield_command_completions("")
+            return
+
+        try:
+            argv = shlex.split(text)
+            trailing_space = text.endswith(" ")
+        except ValueError:
+            return
+
+        current = "" if trailing_space else (argv[-1] if argv else "")
+        tokens = argv if trailing_space else argv[:-1]
+
+        if text.startswith("!"):
+            bang_text = text[1:]
+            try:
+                bang_argv = shlex.split(bang_text)
+                bang_trailing = bang_text.endswith(" ")
+            except ValueError:
+                return
+            bang_current = "" if bang_trailing else (bang_argv[-1] if bang_argv else "")
+            bang_tokens = bang_argv if bang_trailing else bang_argv[:-1]
+            if not bang_tokens:
+                for name in LOCAL_SHELL_COMMANDS:
+                    if name.startswith(bang_current):
+                        yield Completion(name, start_position=-len(bang_current), display=name)
+                return
+            if bang_tokens[0] == "cd":
+                yield from self._yield_local_dir_completions(bang_current)
+            elif bang_tokens[0] in {"ls", "dir"}:
+                yield from self._yield_local_path_completions(bang_current)
+            return
+
+        if not tokens:
+            yield from self._yield_local_dir_completions(current)
+            yield from self._yield_command_completions(current)
+            return
+
+        if tokens[0] == "lcd":
+            yield from self._yield_local_dir_completions(current)
+            return
+        if tokens[0] == "lls":
+            yield from self._yield_local_path_completions(current)
+            return
+        if tokens[0] == "upload":
+            yield from self._yield_local_path_completions(current)
+
 
 class PanShell:
     def __init__(self, state: AppState) -> None:
@@ -70,6 +173,7 @@ class PanShell:
         self.local_cwd = str(Path.cwd())
         self.home_root = state.session.home_path if state.session is not None else "/"
         self.manager: AsyncApiManager | None = None
+        self.completer = LocalPathCompleter(self)
 
     async def login(self) -> None:
         self.state.interactive = True
@@ -104,7 +208,7 @@ class PanShell:
 
     async def run(self) -> None:
         await self.login()
-        session = PromptSession(history=InMemoryHistory())
+        session = PromptSession(history=InMemoryHistory(), completer=self.completer, complete_while_typing=True)
         try:
             while True:
                 try:
@@ -132,7 +236,7 @@ class PanShell:
     def _print_help(self) -> None:
         body = Group(
             self._render_help_section("Shell builtins", INTERACTIVE_COMMANDS),
-            Text("这些命令用于控制 shell 本身，以及切换本地/远端工作目录。", style="muted"),
+            Text("这些命令用于控制 shell 本身，以及切换本地 / 远端工作目录。", style="muted"),
             Text(""),
             self._render_help_section("Stable commands", VISIBLE_COMMANDS),
             Text("这里只展示当前正式对外支持的命令。", style="muted"),
@@ -140,6 +244,7 @@ class PanShell:
             Text("提示", style="accent"),
             Text("  用 '<command> --help' 查看完整参数说明。", style="muted"),
             Text("  在 shell 里，'<command> -h' 会自动等价为 '--help'。", style="muted"),
+            Text("  首字符输入时会同时提示本地目录与可用命令；Tab 可补全本地路径。", style="muted"),
             Text("  `logout` 会注销当前会话并退出；`exit` / `quit` 只退出。", style="muted"),
         )
         self.console.print(Panel.fit(body, title="pansh Shell", border_style="text", padding=(0, 1)))
@@ -171,6 +276,13 @@ class PanShell:
             return self.home_root
         return candidate
 
+    def _resolve_local_path(self, target: str | None = None) -> Path:
+        raw = target or self.local_cwd
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path(self.local_cwd) / candidate
+        return candidate.resolve()
+
     async def handle(self, text: str) -> bool:
         if text in {"exit", "quit"}:
             return True
@@ -181,7 +293,23 @@ class PanShell:
             self.console.clear()
             return False
         if text.startswith("!"):
-            completed = subprocess.run(text[1:], cwd=self.local_cwd, shell=True)
+            bang = text[1:].strip()
+            if not bang:
+                return False
+            try:
+                bang_argv = shlex.split(bang)
+            except ValueError as exc:
+                self.console.print(f"命令解析失败：{exc}", style="error")
+                return False
+            if bang_argv and bang_argv[0] == "cd":
+                target = bang_argv[1] if len(bang_argv) > 1 else "."
+                resolved = self._resolve_local_path(target)
+                if not resolved.exists() or not resolved.is_dir():
+                    self.console.print(f"不是目录：{resolved}", style="error")
+                    return False
+                self.local_cwd = str(resolved)
+                return False
+            completed = subprocess.run(bang, cwd=self.local_cwd, shell=True)
             if completed.returncode != 0:
                 self.console.print(f"本地命令执行失败，退出码 {completed.returncode}", style="error")
             return False
@@ -223,14 +351,14 @@ class PanShell:
             self.console.print(self.local_cwd)
             return False
         if argv[0] == "lcd":
-            target = Path(argv[1] if len(argv) > 1 else self.local_cwd).expanduser().resolve()
+            target = self._resolve_local_path(argv[1] if len(argv) > 1 else self.local_cwd)
             if not target.exists() or not target.is_dir():
                 self.console.print(f"不是目录：{target}", style="error")
                 return False
             self.local_cwd = str(target)
             return False
         if argv[0] == "lls":
-            target = Path(argv[1] if len(argv) > 1 else self.local_cwd).expanduser().resolve()
+            target = self._resolve_local_path(argv[1] if len(argv) > 1 else self.local_cwd)
             if not target.exists():
                 self.console.print(f"路径不存在：{target}", style="error")
                 return False
